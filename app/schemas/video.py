@@ -21,6 +21,10 @@ class VideoProcessRequest(BaseModel):
     target_language: str = Field("en", description="Target language code for dubbing (e.g., 'en', 'vi')")
     article_id: Optional[int] = Field(None, description="Optional article ID to link this video to")
     voice: Optional[str] = Field(None, description="Optional specific TTS voice identifier")
+    tts_engine: str = Field(
+        "xtts",
+        description="TTS engine: 'xtts' for voice cloning (default), 'edge' for broadcast neural TTS",
+    )
 
 
 class DubbedVersionResponse(BaseModel):

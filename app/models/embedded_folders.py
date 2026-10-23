@@ -104,12 +104,12 @@ class EmbeddedFolders(Base):
         nullable=False,
     )
 
-    # 10. Quan hệ danh sách files thuộc folder
-    files: Mapped[list["EmbeddedFiles"]] = relationship(
-        "EmbeddedFiles",
-        back_populates="folder",
-        cascade="all, delete-orphan",
-    )
+    # 10. Quan hệ danh sách files thuộc folder (commented out as EmbeddedFiles is not present)
+    # files: Mapped[list["EmbeddedFiles"]] = relationship(
+    #     "EmbeddedFiles",
+    #     back_populates="folder",
+    #     cascade="all, delete-orphan",
+    # )
 
     # 11. Ràng buộc (Constraints)
     __table_args__ = (

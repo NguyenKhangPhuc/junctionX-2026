@@ -69,6 +69,7 @@ class TranslationService:
                     {"role": "user", "content": user_prompt},
                 ],
                 "stream": False,
+                "keep_alive": 0,
                 "options": {"temperature": 0.3},
             }
             response = httpx.post(

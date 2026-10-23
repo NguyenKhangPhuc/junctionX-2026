@@ -83,6 +83,69 @@ class FFmpegService:
 
         return str(out_file)
 
+    def extract_speaker_sample(
+        self, audio_path: str, output_path: Optional[str] = None, duration: float = 6.0
+    ) -> str:
+        """Extract a clean 3-10s WAV audio segment (22050Hz mono) for voice cloning reference.
+
+        Args:
+            audio_path: Path to original audio file.
+            output_path: Optional destination path for speaker sample.
+            duration: Sample length in seconds (default: 6.0s).
+
+        Returns:
+            str: Path to the extracted reference speaker WAV file.
+
+        Raises:
+            FileNotFoundError: If audio file does not exist.
+            RuntimeError: If FFmpeg extraction fails.
+        """
+        a_file = Path(audio_path).resolve()
+        if not a_file.exists():
+            raise FileNotFoundError(f"Audio file for speaker sample not found: {audio_path}")
+
+        if output_path:
+            out_file = Path(output_path).resolve()
+        else:
+            out_file = self.raw_audio_dir / f"{a_file.stem}_speaker_sample.wav"
+
+        out_file.parent.mkdir(parents=True, exist_ok=True)
+
+        cmd = [
+            "ffmpeg",
+            "-y",
+            "-i",
+            str(a_file),
+            "-ss",
+            "0",
+            "-t",
+            str(duration),
+            "-acodec",
+            "pcm_s16le",
+            "-ar",
+            "22050",
+            "-ac",
+            "1",
+            str(out_file),
+        ]
+
+        logger.info(f"Extracting speaker reference sample: {' '.join(cmd)}")
+        result = subprocess.run(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            check=False,
+        )
+
+        if result.returncode != 0:
+            logger.error(f"Failed to extract speaker sample: {result.stderr}")
+            raise RuntimeError(
+                f"Failed to extract speaker sample with exit code {result.returncode}: {result.stderr}"
+            )
+
+        return str(out_file)
+
     def get_media_duration(self, file_path: str) -> float:
         """Probe the duration of an audio or video file using ffprobe.
 

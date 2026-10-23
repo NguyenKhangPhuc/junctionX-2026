@@ -27,6 +27,7 @@ class VideoPipelineService:
         target_language: str = "en",
         article_id: Optional[int] = None,
         voice: Optional[str] = None,
+        tts_engine: str = "xtts",
     ) -> VideoProcessResponse:
         """Execute the end-to-end video dubbing pipeline.
 
@@ -155,6 +156,29 @@ class VideoPipelineService:
                 f"Translated transcript already cached for video ID {video.id} in {target_language}."
             )
 
+        # If no spoken speech was detected at all, handle gracefully without crashing TTS
+        if not (dubbed_version.transcript_text or "").strip():
+            logger.info(
+                f"No speech detected in video ID {video.id}. Keeping original audio and video."
+            )
+            dubbed_version.dubbed_audio_path = video.original_audio_path
+            dubbed_version.dubbed_video_path = video.file_path
+            dubbed_version.status = "completed"
+            db.commit()
+            db.refresh(dubbed_version)
+            return VideoProcessResponse(
+                video_id=video.id,
+                file_name=video.file_name,
+                file_path=video.file_path,
+                original_audio_path=video.original_audio_path,
+                duration=video.duration,
+                original_language=video.original_language,
+                original_transcript_text=video.original_transcript_text,
+                original_transcript_json=video.original_transcript_json,
+                is_default_file=True,
+                dubbed_version=DubbedVersionResponse.model_validate(dubbed_version),
+            )
+
         # 5. Synthesize speech for translated transcript
         need_tts = (
             not dubbed_version.dubbed_audio_path
@@ -163,17 +187,32 @@ class VideoPipelineService:
 
         if need_tts:
             logger.info(
-                f"Synthesizing dubbed speech for video ID {video.id} in {target_language}..."
+                f"Synthesizing dubbed speech for video ID {video.id} in {target_language} (engine: {tts_engine})..."
             )
+            # Extract clean speaker sample from original audio if voice cloning is active
+            speaker_sample_path = None
+            if tts_engine.lower() == "xtts" and video.original_audio_path:
+                try:
+                    speaker_sample_path = ffmpeg_service.extract_speaker_sample(
+                        video.original_audio_path
+                    )
+                except Exception as e:
+                    logger.warning(
+                        f"Could not extract speaker sample ({e}). XTTS-v2 may fall back to Edge-TTS."
+                    )
+
+            dubbed_audio_ext = "wav" if tts_engine.lower() == "xtts" else "mp3"
             dubbed_audio_dest = (
                 ffmpeg_service.dubbed_audio_dir
-                / f"{video.id}_{target_language}_{resolved_video.stem}.mp3"
+                / f"{video.id}_{target_language}_{resolved_video.stem}.{dubbed_audio_ext}"
             )
             dubbed_audio_path = tts_service.synthesize_speech(
                 text=dubbed_version.transcript_text or "",
                 target_language=target_language,
+                speaker_wav_path=speaker_sample_path,
                 output_path=str(dubbed_audio_dest),
                 voice=voice,
+                engine=tts_engine,
             )
             dubbed_version.dubbed_audio_path = dubbed_audio_path
             db.commit()

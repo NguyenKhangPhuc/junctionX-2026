@@ -53,6 +53,7 @@ def process_video_endpoint(
             target_language=request.target_language,
             article_id=request.article_id,
             voice=request.voice,
+            tts_engine=request.tts_engine,
         )
         return response
     except FileNotFoundError as fnf_err:
