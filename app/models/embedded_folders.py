@@ -20,7 +20,7 @@ from sqlalchemy.orm import Mapped, mapped_column, relationship
 from app.utils.database import Base
 
 if TYPE_CHECKING:
-    from app.models.embedded_files import EmbeddedFiles
+    from app.models.embedded_files import EmbeddedFiles  # noqa: TC004  (needed by ORM relationship resolution)
 
 
 class FolderKind(str, enum.Enum):
@@ -104,12 +104,12 @@ class EmbeddedFolders(Base):
         nullable=False,
     )
 
-    # 10. Quan hệ danh sách files thuộc folder (commented out as EmbeddedFiles is not present)
-    # files: Mapped[list["EmbeddedFiles"]] = relationship(
-    #     "EmbeddedFiles",
-    #     back_populates="folder",
-    #     cascade="all, delete-orphan",
-    # )
+    # 10. Quan hệ danh sách files thuộc folder
+    files: Mapped[list["EmbeddedFiles"]] = relationship(
+        "EmbeddedFiles",
+        back_populates="folder",
+        cascade="all, delete-orphan",
+    )
 
     # 11. Ràng buộc (Constraints)
     __table_args__ = (
