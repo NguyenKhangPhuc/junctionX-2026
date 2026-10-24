@@ -6,6 +6,9 @@ import os
 from typing import Any, Dict, List, Optional, Tuple
 
 import httpx
+from dotenv import load_dotenv
+
+load_dotenv()
 
 logger = logging.getLogger(__name__)
 
@@ -15,31 +18,56 @@ class TranslationService:
 
     def __init__(self):
         self.openrouter_api_key = os.getenv("OPENROUTER_API_KEY")
-        self.openrouter_model = os.getenv("OPENROUTER_MODEL", "google/gemma-4-31b-it:free")
+        self.openrouter_model = os.getenv("OPENROUTER_MODEL", "meta-llama/llama-3.3-70b-instruct:free")
         self.ollama_host = os.getenv("OLLAMA_HOST", "http://127.0.0.1:11434")
         self.ollama_model = os.getenv("LLM_MODEL", "llama3.2")
 
-    def _call_openrouter(self, system_prompt: str, user_prompt: str) -> Optional[str]:
-        """Call OpenRouter API using OpenAI SDK format via httpx."""
-        if not self.openrouter_api_key:
-            return None
+    @property
+    def api_key(self) -> Optional[str]:
+        """Dynamic lookup for OpenRouter API key."""
+        return os.getenv("OPENROUTER_API_KEY") or self.openrouter_api_key
+
+    @property
+    def model_name(self) -> str:
+        """Dynamic lookup for OpenRouter Model."""
+        return os.getenv("OPENROUTER_MODEL") or self.openrouter_model
+
+    def _call_openrouter(self, system_prompt: str, user_prompt: str) -> Tuple[Optional[str], Optional[str]]:
+        """Call OpenRouter API using OpenAI SDK format via httpx.
+
+        Returns:
+            Tuple of (response_text, error_message).
+        """
+        api_key = self.api_key
+        if not api_key:
+            return None, "OPENROUTER_API_KEY not configured"
+
+        model = self.model_name
+        models_list = [
+            model,
+            "meta-llama/llama-3.3-70b-instruct:free",
+            "meta-llama/llama-3.2-3b-instruct:free",
+            "openrouter/free",
+        ]
+        # OpenRouter strictly enforces a maximum of 3 items in the 'models' array
+        unique_models = list(dict.fromkeys(models_list))[:3]
 
         try:
             headers = {
-                "Authorization": f"Bearer {self.openrouter_api_key}",
+                "Authorization": f"Bearer {api_key}",
                 "Content-Type": "application/json",
                 "HTTP-Referer": "http://localhost:5605",
                 "X-Title": "Video Dubbing Pipeline",
             }
             payload = {
-                "model": self.openrouter_model,
+                "models": unique_models,
                 "messages": [
                     {"role": "system", "content": system_prompt},
                     {"role": "user", "content": user_prompt},
                 ],
                 "temperature": 0.3,
             }
-            logger.info(f"Calling OpenRouter model '{self.openrouter_model}' for translation...")
+            logger.info(f"Calling OpenRouter with models fallback {unique_models} for translation...")
             response = httpx.post(
                 "https://openrouter.ai/api/v1/chat/completions",
                 headers=headers,
@@ -48,15 +76,14 @@ class TranslationService:
             )
             if response.status_code == 200:
                 data = response.json()
-                return data["choices"][0]["message"]["content"].strip()
+                return data["choices"][0]["message"]["content"].strip(), None
             else:
-                logger.warning(
-                    f"OpenRouter returned status {response.status_code}: {response.text}"
-                )
-                return None
+                err_msg = f"HTTP {response.status_code}: {response.text}"
+                logger.warning(f"OpenRouter returned status {err_msg}")
+                return None, err_msg
         except Exception as e:
             logger.warning(f"Failed to query OpenRouter: {e}")
-            return None
+            return None, str(e)
 
     def _call_ollama(self, system_prompt: str, user_prompt: str) -> str:
         """Fallback to local Ollama instance."""
@@ -82,16 +109,24 @@ class TranslationService:
             return data["message"]["content"].strip()
         except Exception as e:
             logger.error(f"Local Ollama call failed: {e}", exc_info=True)
-            raise RuntimeError(f"All LLM translation backends failed. Ollama error: {e}") from e
+            raise RuntimeError(f"Ollama error: {e}") from e
 
     def _call_llm(self, system_prompt: str, user_prompt: str) -> str:
         """Route to OpenRouter if configured, otherwise fallback to local Ollama."""
-        if self.openrouter_api_key:
-            res = self._call_openrouter(system_prompt, user_prompt)
+        openrouter_error = None
+        if self.api_key:
+            res, openrouter_error = self._call_openrouter(system_prompt, user_prompt)
             if res:
                 return res
 
-        return self._call_ollama(system_prompt, user_prompt)
+        try:
+            return self._call_ollama(system_prompt, user_prompt)
+        except Exception as ollama_err:
+            if openrouter_error:
+                raise RuntimeError(
+                    f"All LLM translation backends failed. OpenRouter error: {openrouter_error} | Ollama error: {ollama_err}"
+                ) from ollama_err
+            raise RuntimeError(f"All LLM translation backends failed. {ollama_err}") from ollama_err
 
     def translate_segments(
         self,

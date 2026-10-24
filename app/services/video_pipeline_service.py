@@ -102,8 +102,18 @@ class VideoPipelineService:
             )
 
         # 3. Transcribe original speech (is_default_file = True)
-        if not video.original_transcript_json or not video.original_transcript_text:
-            logger.info(f"Transcribing original audio for video ID {video.id}...")
+        need_transcribe = (
+            not video.original_transcript_json
+            or not video.original_transcript_text
+            or (
+                isinstance(video.original_transcript_json, list)
+                and len(video.original_transcript_json) > 0
+                and float(video.original_transcript_json[0].get("start", 0.0)) == 0.0
+            )
+        )
+
+        if need_transcribe:
+            logger.info(f"Transcribing original audio with VAD filter for video ID {video.id}...")
             stt_result = stt_service.transcribe_audio(video.original_audio_path)
             video.original_transcript_text = stt_result["full_text"]
             video.original_transcript_json = stt_result["segments"]
@@ -137,8 +147,19 @@ class VideoPipelineService:
             db.commit()
             db.refresh(dubbed_version)
 
-        # Translate transcript if needed
-        if not dubbed_version.transcript_json or not dubbed_version.transcript_text:
+        # Translate transcript if needed (or if re-transcribed with VAD)
+        need_translate = (
+            need_transcribe
+            or not dubbed_version.transcript_json
+            or not dubbed_version.transcript_text
+            or (
+                isinstance(dubbed_version.transcript_json, list)
+                and len(dubbed_version.transcript_json) > 0
+                and float(dubbed_version.transcript_json[0].get("start", 0.0)) == 0.0
+            )
+        )
+
+        if need_translate:
             logger.info(
                 f"Translating transcript for video ID {video.id} from {video.original_language} to {target_language}..."
             )
@@ -149,6 +170,8 @@ class VideoPipelineService:
             )
             dubbed_version.transcript_text = trans_text
             dubbed_version.transcript_json = trans_segments
+            dubbed_version.dubbed_audio_path = None
+            dubbed_version.dubbed_video_path = None
             db.commit()
             db.refresh(dubbed_version)
         else:
@@ -179,10 +202,17 @@ class VideoPipelineService:
                 dubbed_version=DubbedVersionResponse.model_validate(dubbed_version),
             )
 
-        # 5. Synthesize speech for translated transcript
+        dubbed_audio_ext = "wav" if tts_engine.lower() == "xtts" else "mp3"
+        dubbed_audio_dest = (
+            ffmpeg_service.dubbed_audio_dir
+            / f"{video.id}_{target_language}_{resolved_video.stem}.{dubbed_audio_ext}"
+        )
+
         need_tts = (
             not dubbed_version.dubbed_audio_path
             or not Path(dubbed_version.dubbed_audio_path).exists()
+            or str(dubbed_audio_dest) != str(Path(dubbed_version.dubbed_audio_path).resolve())
+            or (tts_engine.lower() == "xtts" and "_edge" in str(dubbed_version.dubbed_audio_path))
         )
 
         if need_tts:
@@ -191,30 +221,83 @@ class VideoPipelineService:
             )
             # Extract clean speaker sample from original audio if voice cloning is active
             speaker_sample_path = None
-            if tts_engine.lower() == "xtts" and video.original_audio_path:
+            if video.original_audio_path:
                 try:
+                    start_offset = 0.0
+                    if video.original_transcript_json and isinstance(video.original_transcript_json, list):
+                        for seg in video.original_transcript_json:
+                            if isinstance(seg, dict) and seg.get("text", "").strip():
+                                start_offset = float(seg.get("start", 0.0))
+                                break
                     speaker_sample_path = ffmpeg_service.extract_speaker_sample(
-                        video.original_audio_path
+                        video.original_audio_path,
+                        start_time=start_offset,
                     )
                 except Exception as e:
                     logger.warning(
-                        f"Could not extract speaker sample ({e}). XTTS-v2 may fall back to Edge-TTS."
+                        f"Could not extract speaker sample ({e})."
                     )
 
-            dubbed_audio_ext = "wav" if tts_engine.lower() == "xtts" else "mp3"
-            dubbed_audio_dest = (
-                ffmpeg_service.dubbed_audio_dir
-                / f"{video.id}_{target_language}_{resolved_video.stem}.{dubbed_audio_ext}"
-            )
-            dubbed_audio_path = tts_service.synthesize_speech(
-                text=dubbed_version.transcript_text or "",
-                target_language=target_language,
-                speaker_wav_path=speaker_sample_path,
-                output_path=str(dubbed_audio_dest),
-                voice=voice,
-                engine=tts_engine,
-            )
+            # Estimate speaker pitch and gender to inform TTS voice selection
+            detected_gender = "male"
+            ref_for_pitch = speaker_sample_path or video.original_audio_path
+            if ref_for_pitch and Path(ref_for_pitch).exists():
+                detected_gender = tts_service.estimate_gender(ref_for_pitch)
+                logger.info(
+                    f"Estimated speaker gender for video ID {video.id}: '{detected_gender}'"
+                )
+
+            # Segment-level timeline assembly
+            segments = dubbed_version.transcript_json or []
+            if segments and isinstance(segments, list):
+                clips_dir = (
+                    ffmpeg_service.dubbed_audio_dir / f"clips_{video.id}_{target_language}"
+                )
+                clips_dir.mkdir(parents=True, exist_ok=True)
+                clips = []
+                for idx, seg in enumerate(segments):
+                    seg_text = seg.get("text", "").strip() if isinstance(seg, dict) else ""
+                    if not seg_text:
+                        continue
+                    clip_ext = "wav" if tts_engine.lower() == "xtts" else "mp3"
+                    clip_path = clips_dir / f"seg_{idx:03d}_{tts_engine}.{clip_ext}"
+                    tts_service.synthesize_speech(
+                        text=seg_text,
+                        target_language=target_language,
+                        speaker_wav_path=speaker_sample_path,
+                        output_path=str(clip_path),
+                        voice=voice,
+                        engine=tts_engine,
+                        gender=detected_gender,
+                    )
+                    clips.append(
+                        {
+                            "path": str(clip_path),
+                            "start": float(seg.get("start", 0.0)),
+                            "end": float(seg.get("end", 0.0)),
+                            "text": seg_text,
+                        }
+                    )
+
+                total_duration = video.duration or ffmpeg_service.get_media_duration(video.file_path)
+                dubbed_audio_path = ffmpeg_service.build_timeline_track(
+                    clips=clips,
+                    total_duration=total_duration,
+                    output_path=str(dubbed_audio_dest),
+                )
+            else:
+                dubbed_audio_path = tts_service.synthesize_speech(
+                    text=dubbed_version.transcript_text or "",
+                    target_language=target_language,
+                    speaker_wav_path=speaker_sample_path,
+                    output_path=str(dubbed_audio_dest),
+                    voice=voice,
+                    engine=tts_engine,
+                    gender=detected_gender,
+                )
+
             dubbed_version.dubbed_audio_path = dubbed_audio_path
+            dubbed_version.dubbed_video_path = None
             db.commit()
             db.refresh(dubbed_version)
         else:
@@ -226,6 +309,7 @@ class VideoPipelineService:
         need_merge = (
             not dubbed_version.dubbed_video_path
             or not Path(dubbed_version.dubbed_video_path).exists()
+            or need_tts
         )
 
         if need_merge:

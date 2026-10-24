@@ -64,7 +64,12 @@ class STTService:
                 str(target_path),
                 language=language,
                 beam_size=5,
-                word_timestamps=False,
+                word_timestamps=True,
+                vad_filter=True,
+                vad_parameters=dict(
+                    min_silence_duration_ms=400,
+                    speech_pad_ms=200,
+                ),
             )
 
             segments: List[Dict[str, Any]] = []

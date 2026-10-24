@@ -4,7 +4,7 @@ import asyncio
 import logging
 import os
 from pathlib import Path
-from typing import Dict, Optional, Set
+from typing import Any, Dict, Optional, Set, Union
 
 # Automatically accept Coqui non-commercial license without interactive stdin prompts
 os.environ["COQUI_TOS_AGREED"] = "1"
@@ -32,17 +32,41 @@ XTTS_SUPPORTED_LANGUAGES: Set[str] = {
     "hi",
 }
 
-DEFAULT_VOICE_MAP: Dict[str, str] = {
-    "vi": "vi-VN-HoaiMyNeural",
-    "en": "en-US-GuyNeural",
-    "fr": "fr-FR-HenriNeural",
-    "es": "es-ES-AlvaroNeural",
-    "de": "de-DE-KillianNeural",
-    "ja": "ja-JP-KeitaNeural",
-    "zh": "zh-CN-YunxiNeural",
-    "ko": "ko-KR-InJoonNeural",
-    "ru": "ru-RU-DmitryNeural",
-    "fi": "fi-FI-HarriNeural",
+LANGUAGE_ALIAS_MAP: Dict[str, str] = {
+    "france": "fr",
+    "french": "fr",
+    "francais": "fr",
+    "english": "en",
+    "spain": "es",
+    "spanish": "es",
+    "germany": "de",
+    "german": "de",
+    "italy": "it",
+    "italian": "it",
+    "vietnam": "vi",
+    "vietnamese": "vi",
+    "china": "zh-cn",
+    "chinese": "zh-cn",
+    "zh": "zh-cn",
+    "japan": "ja",
+    "japanese": "ja",
+    "russia": "ru",
+    "russian": "ru",
+    "finland": "fi",
+    "finnish": "fi",
+}
+
+DEFAULT_VOICE_MAP: Dict[str, Dict[str, str]] = {
+    "vi": {"female": "vi-VN-HoaiMyNeural", "male": "vi-VN-NamMinhNeural"},
+    "en": {"female": "en-US-JennyNeural", "male": "en-US-GuyNeural"},
+    "fr": {"female": "fr-FR-DeniseNeural", "male": "fr-FR-HenriNeural"},
+    "es": {"female": "es-ES-ElviraNeural", "male": "es-ES-AlvaroNeural"},
+    "de": {"female": "de-DE-KatjaNeural", "male": "de-DE-KillianNeural"},
+    "ja": {"female": "ja-JP-NanamiNeural", "male": "ja-JP-KeitaNeural"},
+    "zh": {"female": "zh-CN-XiaoxiaoNeural", "male": "zh-CN-YunxiNeural"},
+    "ko": {"female": "ko-KR-SunHiNeural", "male": "ko-KR-InJoonNeural"},
+    "ru": {"female": "ru-RU-SvetlanaNeural", "male": "ru-RU-DmitryNeural"},
+    "fi": {"female": "fi-FI-NooraNeural", "male": "fi-FI-HarriNeural"},
 }
 
 
@@ -55,9 +79,33 @@ class TTSService:
         self.dubbed_audio_dir.mkdir(parents=True, exist_ok=True)
         self._xtts_model = None
 
+    def _patch_xtts_audio_loader(self):
+        """Monkeypatch XTTS load_audio with soundfile to avoid torchcodec/libnvrtc CUDA crashes on CPU."""
+        try:
+            import soundfile as sf
+            import torch
+            import torchaudio.functional as F
+            import TTS.tts.models.xtts as xtts_mod
+
+            def custom_load_audio(audiopath, sampling_rate):
+                data, sr = sf.read(str(audiopath), dtype="float32")
+                if data.ndim == 1:
+                    audio = torch.from_numpy(data).unsqueeze(0)
+                else:
+                    audio = torch.from_numpy(data.T).mean(dim=0, keepdim=True)
+                if sr != sampling_rate:
+                    audio = F.resample(audio, sr, sampling_rate)
+                return audio
+
+            xtts_mod.load_audio = custom_load_audio
+            logger.info("Successfully patched XTTS load_audio with soundfile backend.")
+        except Exception as e:
+            logger.warning(f"Could not patch XTTS load_audio: {e}")
+
     def _get_xtts_model(self):
         """Lazily initialize the Coqui XTTS-v2 model."""
         if self._xtts_model is None:
+            self._patch_xtts_audio_loader()
             import torch
             from TTS.api import TTS
 
@@ -71,10 +119,81 @@ class TTSService:
             logger.info("Coqui XTTS-v2 model initialized successfully.")
         return self._xtts_model
 
-    def get_voice_for_language(self, language: str) -> str:
-        """Resolve a suitable neural voice name for a given language code for Edge-TTS."""
-        lang_key = language.lower()[:2]
-        return DEFAULT_VOICE_MAP.get(lang_key, "en-US-GuyNeural")
+    @staticmethod
+    def estimate_f0(audio: Any, sample_rate: int = 16000) -> Optional[float]:
+        """Estimate fundamental frequency (pitch) of an audio signal using autocorrelation.
+
+        Args:
+            audio: numpy array of samples or path to audio file.
+            sample_rate: sampling rate of the signal.
+
+        Returns:
+            Estimated pitch in Hz, or None if signal is silent/too short.
+        """
+        import numpy as np
+
+        if isinstance(audio, (str, Path)):
+            import soundfile as sf
+
+            sig, sr = sf.read(str(audio), dtype="float32")
+        else:
+            sig = np.asarray(audio, dtype=np.float32)
+            sr = sample_rate
+
+        if sig.ndim > 1:
+            sig = sig.mean(axis=1 if sig.shape[1] < sig.shape[0] else 0)
+
+        if len(sig) < int(sr * 0.05):
+            return None
+
+        # Center signal
+        sig = sig - float(np.mean(sig))
+
+        n = len(sig)
+        f_sig = np.fft.rfft(sig, n=2 * n)
+        autocorr = np.fft.irfft(f_sig * np.conj(f_sig))[:n]
+
+        min_lag = max(1, int(sr / 350.0))  # Max 350 Hz
+        max_lag = min(n - 1, int(sr / 70.0))  # Min 70 Hz
+
+        if max_lag <= min_lag:
+            return None
+
+        peak_offset = int(np.argmax(autocorr[min_lag:max_lag]))
+        peak_lag = min_lag + peak_offset
+        if peak_lag == 0:
+            return None
+
+        return float(sr / peak_lag)
+
+    def estimate_gender(self, audio: Any, sample_rate: int = 16000) -> str:
+        """Estimate speaker gender ('female' or 'male') from pitch.
+
+        Typical adult female f0: ~165-260 Hz, male f0: ~85-165 Hz.
+        """
+        f0 = self.estimate_f0(audio, sample_rate)
+        if f0 is not None and f0 >= 165.0:
+            return "female"
+        return "male"
+
+    @staticmethod
+    def normalize_language(language: str) -> str:
+        """Map language name or alias to standardized ISO code."""
+        cleaned = language.lower().strip()
+        if cleaned in LANGUAGE_ALIAS_MAP:
+            return LANGUAGE_ALIAS_MAP[cleaned]
+        if len(cleaned) > 2 and cleaned[:2] in XTTS_SUPPORTED_LANGUAGES:
+            return cleaned[:2]
+        return cleaned
+
+    def get_voice_for_language(self, language: str, gender: str = "male") -> str:
+        """Resolve a suitable neural voice name for a given language code and gender for Edge-TTS."""
+        lang_key = self.normalize_language(language)
+        if len(lang_key) > 2 and lang_key not in {"zh-cn"}:
+            lang_key = lang_key[:2]
+        gender_map = DEFAULT_VOICE_MAP.get(lang_key, DEFAULT_VOICE_MAP["en"])
+        resolved_gender = gender.lower() if gender else "male"
+        return gender_map.get(resolved_gender, gender_map.get("male", "en-US-GuyNeural"))
 
     async def _synthesize_edge_async(
         self,
@@ -82,6 +201,7 @@ class TTSService:
         target_language: str,
         output_path: Optional[str] = None,
         voice: Optional[str] = None,
+        gender: str = "male",
     ) -> str:
         """Asynchronously synthesize text using Microsoft Edge-TTS."""
         import edge_tts
@@ -90,7 +210,7 @@ class TTSService:
         if not clean_text:
             raise ValueError("Cannot synthesize speech from empty text.")
 
-        selected_voice = voice or self.get_voice_for_language(target_language)
+        selected_voice = voice or self.get_voice_for_language(target_language, gender=gender)
 
         if output_path:
             out_file = Path(output_path).resolve()
@@ -119,6 +239,7 @@ class TTSService:
         target_language: str,
         output_path: Optional[str] = None,
         voice: Optional[str] = None,
+        gender: str = "male",
     ) -> str:
         """Synchronous wrapper for Edge-TTS."""
         try:
@@ -132,12 +253,12 @@ class TTSService:
             with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
                 future = pool.submit(
                     asyncio.run,
-                    self._synthesize_edge_async(text, target_language, output_path, voice),
+                    self._synthesize_edge_async(text, target_language, output_path, voice, gender=gender),
                 )
                 return future.result()
         else:
             return asyncio.run(
-                self._synthesize_edge_async(text, target_language, output_path, voice)
+                self._synthesize_edge_async(text, target_language, output_path, voice, gender=gender)
             )
 
     def synthesize_speech(
@@ -148,6 +269,7 @@ class TTSService:
         output_path: Optional[str] = None,
         voice: Optional[str] = None,
         engine: str = "xtts",
+        gender: Optional[str] = None,
     ) -> str:
         """Synthesize speech using either Coqui XTTS-v2 voice cloning or Edge-TTS.
 
@@ -158,6 +280,7 @@ class TTSService:
             output_path: Optional destination audio file path.
             voice: Optional specific Edge-TTS voice name override.
             engine: Engine to use: 'xtts' for voice cloning, 'edge' for broadcast neural voice.
+            gender: Speaker gender ('female' or 'male') for voice selection in Edge-TTS.
 
         Returns:
             str: Path to generated audio file.
@@ -166,9 +289,12 @@ class TTSService:
         if not clean_text:
             raise ValueError("Cannot synthesize speech from empty text.")
 
-        normalized_lang = target_language.lower().strip()
-        if normalized_lang == "zh":
-            normalized_lang = "zh-cn"
+        normalized_lang = self.normalize_language(target_language)
+        resolved_gender = gender
+        if not resolved_gender and speaker_wav_path and Path(speaker_wav_path).exists():
+            resolved_gender = self.estimate_gender(speaker_wav_path)
+        if not resolved_gender:
+            resolved_gender = "male"
 
         # Check if user requested XTTS-v2 voice cloning
         if engine.lower() == "xtts":
@@ -176,20 +302,20 @@ class TTSService:
             if normalized_lang not in XTTS_SUPPORTED_LANGUAGES:
                 logger.warning(
                     f"XTTS-v2 does not support target language '{target_language}'. "
-                    f"Auto-falling back to Edge-TTS with neural voice."
+                    f"Auto-falling back to Edge-TTS with neural voice ({resolved_gender})."
                 )
                 return self._synthesize_edge_sync(
-                    clean_text, target_language, output_path, voice
+                    clean_text, target_language, output_path, voice, gender=resolved_gender
                 )
 
             # 2. Check speaker wav reference audio
             if not speaker_wav_path or not Path(speaker_wav_path).exists():
                 logger.warning(
                     f"Reference audio '{speaker_wav_path}' not found for XTTS-v2 voice cloning. "
-                    f"Auto-falling back to Edge-TTS."
+                    f"Auto-falling back to Edge-TTS ({resolved_gender})."
                 )
                 return self._synthesize_edge_sync(
-                    clean_text, target_language, output_path, voice
+                    clean_text, target_language, output_path, voice, gender=resolved_gender
                 )
 
             # 3. Execute XTTS-v2 Voice Cloning
@@ -216,16 +342,11 @@ class TTSService:
                 )
                 return str(out_file)
             except Exception as e:
-                logger.error(
-                    f"[XTTS-v2] Synthesis failed ({e}). Falling back to Edge-TTS...",
-                    exc_info=True,
-                )
-                return self._synthesize_edge_sync(
-                    clean_text, target_language, output_path, voice
-                )
+                logger.error(f"[XTTS-v2] Synthesis failed: {e}", exc_info=True)
+                raise RuntimeError(f"XTTS-v2 synthesis failed: {e}") from e
 
         # Default / Explicit Edge-TTS
-        return self._synthesize_edge_sync(clean_text, target_language, output_path, voice)
+        return self._synthesize_edge_sync(clean_text, target_language, output_path, voice, gender=resolved_gender)
 
 
 tts_service = TTSService()

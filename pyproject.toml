@@ -1,5 +1,5 @@
 [project]
-name = "assistant-backend"
+name = "junction-backend"
 version = "0.1.0"
 description = "Add your description here"
 readme = "README.md"
@@ -48,6 +48,8 @@ dev = [
 
 [tool.pytest.ini_options]
 pythonpath = ["."]
+testpaths = ["tests"]
+norecursedirs = ["data", ".venv"]
 
 [tool.ruff.lint]
 ignore = ["B008", "BLE001"]

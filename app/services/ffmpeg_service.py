@@ -5,7 +5,7 @@ import logging
 import os
 import subprocess
 from pathlib import Path
-from typing import Optional
+from typing import Any, Dict, List, Optional
 
 logger = logging.getLogger(__name__)
 
@@ -84,13 +84,18 @@ class FFmpegService:
         return str(out_file)
 
     def extract_speaker_sample(
-        self, audio_path: str, output_path: Optional[str] = None, duration: float = 6.0
+        self,
+        audio_path: str,
+        output_path: Optional[str] = None,
+        start_time: float = 0.0,
+        duration: float = 10.0,
     ) -> str:
         """Extract a clean 3-10s WAV audio segment (22050Hz mono) for voice cloning reference.
 
         Args:
             audio_path: Path to original audio file.
             output_path: Optional destination path for speaker sample.
+            start_time: Offset in seconds where clear speech begins (default: 0.0s).
             duration: Sample length in seconds (default: 6.0s).
 
         Returns:
@@ -114,10 +119,10 @@ class FFmpegService:
         cmd = [
             "ffmpeg",
             "-y",
+            "-ss",
+            str(max(0.0, start_time)),
             "-i",
             str(a_file),
-            "-ss",
-            "0",
             "-t",
             str(duration),
             "-acodec",
@@ -252,6 +257,134 @@ class FFmpegService:
                 f"FFmpeg merge failed with exit code {result.returncode}: {result.stderr}"
             )
 
+        return str(out_file)
+
+    @staticmethod
+    def compute_tempo(
+        clip_duration: float, slot_duration: float, max_speedup: float = 1.35
+    ) -> float:
+        """Compute the tempo speedup factor needed to fit clip_duration into slot_duration.
+
+        Args:
+            clip_duration: Duration of the synthesized audio in seconds.
+            slot_duration: Target duration of the speech slot in seconds.
+            max_speedup: Maximum allowed tempo scaling factor.
+
+        Returns:
+            float: Tempo scaling factor (1.0 to max_speedup).
+        """
+        if slot_duration <= 0.0 or clip_duration <= slot_duration:
+            return 1.0
+        return min(max_speedup, float(clip_duration / slot_duration))
+
+    def adjust_clip_tempo(
+        self, clip_path: str, tempo: float, output_path: Optional[str] = None
+    ) -> str:
+        """Apply atempo filter to an audio clip using FFmpeg."""
+        if abs(tempo - 1.0) < 0.02:
+            return clip_path
+
+        c_file = Path(clip_path).resolve()
+        if output_path:
+            out_file = Path(output_path).resolve()
+        else:
+            out_file = c_file.parent / f"{c_file.stem}_tempo_{tempo:.2f}{c_file.suffix}"
+
+        cmd = [
+            "ffmpeg",
+            "-y",
+            "-i",
+            str(c_file),
+            "-filter:a",
+            f"atempo={tempo:.3f}",
+            str(out_file),
+        ]
+        result = subprocess.run(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            check=False,
+        )
+        if result.returncode != 0:
+            logger.warning(
+                f"Failed to adjust clip tempo: {result.stderr}. Using original clip."
+            )
+            return clip_path
+        return str(out_file)
+
+    def build_timeline_track(
+        self,
+        clips: List[Dict[str, Any]],
+        total_duration: float,
+        output_path: str,
+        sample_rate: int = 24000,
+        max_speedup: float = 1.35,
+    ) -> str:
+        """Assemble time-coded audio clips onto a master timeline with exact silence padding.
+
+        Args:
+            clips: List of dicts with {"path": str, "start": float, "end": float, "text": str}.
+            total_duration: Total duration of the target media in seconds.
+            output_path: Destination file path for assembled master track.
+            sample_rate: Output audio sampling rate in Hz (default: 24000).
+            max_speedup: Maximum allowable speedup factor.
+
+        Returns:
+            str: Path to the generated master WAV audio track.
+        """
+        import numpy as np
+        import soundfile as sf
+
+        out_file = Path(output_path).resolve()
+        out_file.parent.mkdir(parents=True, exist_ok=True)
+
+        total_samples = max(1, int(round(total_duration * sample_rate)))
+        master = np.zeros(total_samples, dtype=np.float32)
+
+        for clip in clips:
+            clip_path = clip.get("path")
+            if not clip_path or not Path(clip_path).exists():
+                continue
+
+            start_sec = max(0.0, float(clip.get("start", 0.0)))
+            end_sec = float(clip.get("end", start_sec))
+            slot_dur = max(0.1, end_sec - start_sec)
+
+            clip_dur = self.get_media_duration(clip_path)
+            actual_path = clip_path
+            tempo = self.compute_tempo(clip_dur, slot_dur, max_speedup=max_speedup)
+            if tempo > 1.02:
+                actual_path = self.adjust_clip_tempo(clip_path, tempo)
+
+            data, sr = sf.read(actual_path, dtype="float32")
+            if data.ndim > 1:
+                data = data.mean(axis=1)
+
+            if sr != sample_rate:
+                import torch
+                import torchaudio.functional as F
+
+                t_data = torch.from_numpy(data).unsqueeze(0)
+                t_resampled = F.resample(t_data, sr, sample_rate)
+                data = t_resampled.squeeze(0).numpy()
+
+            start_idx = int(round(start_sec * sample_rate))
+            end_idx = start_idx + len(data)
+
+            if start_idx >= total_samples:
+                continue
+
+            if end_idx > total_samples:
+                master[start_idx:] += data[: total_samples - start_idx]
+            else:
+                master[start_idx:end_idx] += data
+
+        peak = float(np.max(np.abs(master)))
+        if peak > 1.0:
+            master = master / peak
+
+        sf.write(str(out_file), master, sample_rate, subtype="PCM_16")
         return str(out_file)
 
 
