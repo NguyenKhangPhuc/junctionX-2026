@@ -1,0 +1,330 @@
+"""Translation service supporting OpenRouter and local Ollama fallback."""
+
+import json
+import logging
+import os
+from typing import Any, Dict, List, Optional, Tuple
+
+import httpx
+from dotenv import load_dotenv
+
+load_dotenv()
+
+logger = logging.getLogger(__name__)
+
+OULU_EXPLANATORY_SYSTEM_PROMPT = """
+You are a senior bilingual news editor at Kaleva Media serving international tech workers and their families in Oulu, Finland.
+Follow Finland's JSN Journalistic Guidelines: strictly separate verified facts from context, never invent policies, and cite sources.
+
+Given a Finnish news item and optional Oulu City API data, return ONLY valid JSON matching this exact schema:
+{
+  "headline_en": "Translated, clear headline",
+  "relevance_tag": "One of: [Family & Daycare, Housing & Energy, Transport & Winter, Healthcare & Kela, Work & Tax, Local Culture]",
+  "spoken_narration_segments": [
+    {"start": 0.0, "end": 6.0, "text": "Clear spoken English for video/audio dubbing..."}
+  ],
+  "expat_explainer_box": [
+    {
+      "finnish_term": "e.g., Varhaiskasvatus / Wilma / Talvikunnossapito",
+      "what_it_means_for_you": "Plain-English explanation of how an international family in Oulu should act on this."
+    }
+  ]
+}
+"""
+
+
+class TranslationService:
+    """Service translating text and structured time-coded segments using LLMs."""
+
+    def __init__(self):
+        self.openrouter_api_key = os.getenv("OPENROUTER_API_KEY")
+        self.openrouter_model = os.getenv(
+            "OPENROUTER_MODEL", "meta-llama/llama-3.3-70b-instruct:free"
+        )
+        self.ollama_host = os.getenv("OLLAMA_HOST", "http://127.0.0.1:11434")
+        self.ollama_model = os.getenv("LLM_MODEL") or "llama3.2"
+
+    @property
+    def api_key(self) -> Optional[str]:
+        """Dynamic lookup for OpenRouter API key."""
+        return os.getenv("OPENROUTER_API_KEY") or self.openrouter_api_key
+
+    @property
+    def model_name(self) -> str:
+        """Dynamic lookup for OpenRouter Model."""
+        return os.getenv("OPENROUTER_MODEL") or self.openrouter_model
+
+    def _call_openrouter(
+        self, system_prompt: str, user_prompt: str
+    ) -> Tuple[Optional[str], Optional[str]]:
+        """Call OpenRouter API using OpenAI SDK format via httpx.
+
+        Returns:
+            Tuple of (response_text, error_message).
+        """
+        api_key = self.api_key
+        if not api_key:
+            return None, "OPENROUTER_API_KEY not configured"
+
+        model = self.model_name
+        models_list = [
+            model,
+            "meta-llama/llama-3.3-70b-instruct:free",
+            "meta-llama/llama-3.2-3b-instruct:free",
+            "openrouter/free",
+        ]
+        # OpenRouter strictly enforces a maximum of 3 items in the 'models' array
+        unique_models = list(dict.fromkeys(models_list))[:3]
+
+        try:
+            headers = {
+                "Authorization": f"Bearer {api_key}",
+                "Content-Type": "application/json",
+                "HTTP-Referer": "http://localhost:5605",
+                "X-Title": "Video Dubbing Pipeline",
+            }
+            payload = {
+                "models": unique_models,
+                "messages": [
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_prompt},
+                ],
+                "temperature": 0.3,
+            }
+            logger.info(
+                f"Calling OpenRouter with models fallback {unique_models} for translation..."
+            )
+            response = httpx.post(
+                "https://openrouter.ai/api/v1/chat/completions",
+                headers=headers,
+                json=payload,
+                timeout=60.0,
+            )
+            if response.status_code == 200:
+                data = response.json()
+                return data["choices"][0]["message"]["content"].strip(), None
+            else:
+                err_msg = f"HTTP {response.status_code}: {response.text}"
+                logger.warning(f"OpenRouter returned status {err_msg}")
+                return None, err_msg
+        except Exception as e:
+            logger.warning(f"Failed to query OpenRouter: {e}")
+            return None, str(e)
+
+    def _call_ollama(self, system_prompt: str, user_prompt: str) -> str:
+        """Fallback to local Ollama instance."""
+        try:
+            logger.info(
+                f"Calling local Ollama model '{self.ollama_model}' at {self.ollama_host}..."
+            )
+            payload = {
+                "model": self.ollama_model,
+                "messages": [
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_prompt},
+                ],
+                "stream": False,
+                "keep_alive": 0,
+                "options": {"temperature": 0.3},
+            }
+            response = httpx.post(
+                f"{self.ollama_host}/api/chat",
+                json=payload,
+                timeout=60.0,
+            )
+            response.raise_for_status()
+            data = response.json()
+            return data["message"]["content"].strip()
+        except Exception as e:
+            logger.error(f"Local Ollama call failed: {e}", exc_info=True)
+            raise RuntimeError(f"Ollama error: {e}") from e
+
+    def _call_llm(self, system_prompt: str, user_prompt: str) -> str:
+        """Route to OpenRouter if configured, otherwise fallback to local Ollama."""
+        openrouter_error = None
+        if self.api_key:
+            res, openrouter_error = self._call_openrouter(system_prompt, user_prompt)
+            if res:
+                return res
+
+        try:
+            return self._call_ollama(system_prompt, user_prompt)
+        except Exception as ollama_err:
+            if openrouter_error:
+                raise RuntimeError(
+                    f"All LLM translation backends failed. OpenRouter error: {openrouter_error} | Ollama error: {ollama_err}"
+                ) from ollama_err
+            raise RuntimeError(
+                f"All LLM translation backends failed. {ollama_err}"
+            ) from ollama_err
+
+    @staticmethod
+    def _strip_code_fences(raw_text: str) -> str:
+        """Remove markdown code fences around JSON output."""
+        cleaned = raw_text.strip()
+        if cleaned.startswith("```json"):
+            cleaned = cleaned[7:]
+        elif cleaned.startswith("```"):
+            cleaned = cleaned[3:]
+        if cleaned.endswith("```"):
+            cleaned = cleaned[:-3]
+        return cleaned.strip()
+
+    def generate_oulu_explanatory_digest(
+        self,
+        finnish_text: str,
+        ouka_context: str = "",
+        segments: Optional[List[Dict[str, Any]]] = None,
+        target_lang: str = "en",
+    ) -> Tuple[str, Dict[str, Any]]:
+        """Generate structured Oulu explanatory JSON and narration text for international residents.
+
+        Returns:
+            Tuple[str, Dict[str, Any]]: (joined_spoken_narration_text, structured_json_dict)
+        """
+        user_payload = {
+            "target_language": target_lang,
+            "finnish_news_item": finnish_text,
+            "oulu_city_api_context": ouka_context or "General Oulu municipal jurisdiction.",
+            "source_segments": segments or [],
+        }
+        user_prompt = json.dumps(user_payload, ensure_ascii=False)
+
+        try:
+            raw_response = self._call_llm(
+                OULU_EXPLANATORY_SYSTEM_PROMPT.strip(), user_prompt
+            )
+            cleaned = self._strip_code_fences(raw_response)
+            parsed = json.loads(cleaned)
+
+            if isinstance(parsed, dict):
+                narration_segments = parsed.get("spoken_narration_segments") or []
+                if not isinstance(narration_segments, list) or not narration_segments:
+                    narration_segments = [
+                        {
+                            "start": 0.0,
+                            "end": 10.0,
+                            "text": str(parsed.get("headline_en") or finnish_text),
+                        }
+                    ]
+                    parsed["spoken_narration_segments"] = narration_segments
+
+                full_narration = " ".join(
+                    str(seg.get("text", "")).strip()
+                    for seg in narration_segments
+                    if isinstance(seg, dict) and seg.get("text")
+                ).strip()
+
+                parsed.setdefault("headline_en", "Oulu Local News Update")
+                parsed.setdefault("relevance_tag", "Local Culture")
+                parsed.setdefault("expat_explainer_box", [])
+
+                return full_narration, parsed
+        except Exception as e:
+            logger.warning(
+                f"Explanatory JSON generation failed ({e}). Using fallback digest structure..."
+            )
+
+        # Fallback if LLM returns non-JSON or fails
+        fallback_segments = segments or [{"start": 0.0, "end": 8.0, "text": finnish_text}]
+        trans_text, trans_segs = self.translate_segments(
+            segments=fallback_segments, source_lang="fi", target_lang=target_lang
+        )
+        fallback_payload = {
+            "headline_en": trans_text[:100] if trans_text else "Oulu News Digest",
+            "relevance_tag": "Local Culture",
+            "spoken_narration_segments": trans_segs,
+            "expat_explainer_box": [
+                {
+                    "finnish_term": "Oulun kaupunki (City of Oulu)",
+                    "what_it_means_for_you": (
+                        f"Municipal context from api.ouka.fi: {ouka_context or 'Check ouka.fi for local city services.'}"
+                    ),
+                }
+            ],
+        }
+        return trans_text, fallback_payload
+
+    def translate_segments(
+        self,
+        segments: List[Dict[str, Any]],
+        source_lang: str,
+        target_lang: str,
+    ) -> Tuple[str, List[Dict[str, Any]]]:
+        """Translate a sequence of time-coded speech segments to target language.
+
+        Preserves start/end timestamps and returns both the translated continuous text
+        and updated segment list.
+        """
+        if not segments:
+            return "", []
+
+        # If source and target language are the same, return as-is
+        if source_lang.lower() == target_lang.lower():
+            full = " ".join([s["text"] for s in segments])
+            return full, segments
+
+        system_prompt = (
+            f"You are a professional multilingual translator specializing in subtitle and news translation. "
+            f"Translate the provided dialogue segments from {source_lang} to {target_lang}. "
+            f"CRITICAL RULES:\n"
+            f"1. You MUST maintain natural tone and matching meaning.\n"
+            f"2. You MUST keep the exact same start and end timestamps for each item.\n"
+            f"3. Output MUST be valid JSON array of objects with keys 'start', 'end', and 'text'.\n"
+            f"4. Do NOT include markdown code fences (like ```json), explanations, or notes. ONLY output raw JSON."
+        )
+
+        user_prompt = json.dumps(segments, ensure_ascii=False)
+
+        try:
+            raw_response = self._call_llm(system_prompt, user_prompt)
+            cleaned = self._strip_code_fences(raw_response)
+
+            parsed = json.loads(cleaned)
+            if isinstance(parsed, list) and len(parsed) > 0:
+                translated_segments = []
+                translated_texts = []
+                for idx, orig in enumerate(segments):
+                    if idx < len(parsed):
+                        text = str(parsed[idx].get("text", orig["text"])).strip()
+                    else:
+                        text = orig["text"]
+
+                    translated_segments.append(
+                        {
+                            "start": orig["start"],
+                            "end": orig["end"],
+                            "text": text,
+                        }
+                    )
+                    translated_texts.append(text)
+
+                full_translated_text = " ".join(translated_texts)
+                return full_translated_text, translated_segments
+
+        except Exception as e:
+            logger.warning(
+                f"Structured JSON translation failed ({e}). Falling back to whole text translation..."
+            )
+
+        # Fallback: Translate full text (guarded so offline LLM doesn't crash ingestion)
+        full_source = " ".join([s["text"] for s in segments])
+        fb_sys = f"Translate the following text from {source_lang} to {target_lang}. Output only the translation."
+        try:
+            full_translated_text = self._call_llm(fb_sys, full_source).strip()
+        except Exception as fallback_err:
+            logger.warning(
+                f"Fallback LLM call unavailable ({fallback_err}); retaining original text for human editor review."
+            )
+            full_translated_text = f"[Draft awaiting editor translation] {full_source}"
+
+        translated_segments = [
+            {"start": s["start"], "end": s["end"], "text": s["text"]} for s in segments
+        ]
+        if translated_segments:
+            translated_segments[0]["text"] = full_translated_text
+
+        return full_translated_text, translated_segments
+
+
+translation_service = TranslationService()
