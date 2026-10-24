@@ -31,10 +31,13 @@ class ArticleResponse(ArticleBase):
     model_config = ConfigDict(from_attributes=True)
 
 
+from app.schemas.video import VideoDetailResponse
+
+
 class ArticleDetailResponse(ArticleResponse):
     """Schema for detailed Article information including attached videos."""
 
-    videos: List[Any] = Field(default_factory=list, description="Associated video records")
+    videos: List[VideoDetailResponse] = Field(default_factory=list, description="Associated video records")
 
     model_config = ConfigDict(from_attributes=True)
 

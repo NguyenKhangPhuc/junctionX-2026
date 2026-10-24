@@ -18,7 +18,7 @@ class TranslationService:
 
     def __init__(self):
         self.openrouter_api_key = os.getenv("OPENROUTER_API_KEY")
-        self.openrouter_model = os.getenv("OPENROUTER_MODEL", "meta-llama/llama-3.3-70b-instruct:free")
+        self.openrouter_model = os.getenv("OPENROUTER_MODEL", "google/gemini-2.5-flash")
         self.ollama_host = os.getenv("OLLAMA_HOST", "http://127.0.0.1:11434")
         self.ollama_model = os.getenv("LLM_MODEL", "llama3.2")
 
@@ -45,9 +45,8 @@ class TranslationService:
         model = self.model_name
         models_list = [
             model,
-            "meta-llama/llama-3.3-70b-instruct:free",
-            "meta-llama/llama-3.2-3b-instruct:free",
-            "openrouter/free",
+            "google/gemini-2.5-flash-lite",
+            "meta-llama/llama-3.1-8b-instruct",
         ]
         # OpenRouter strictly enforces a maximum of 3 items in the 'models' array
         unique_models = list(dict.fromkeys(models_list))[:3]
@@ -65,14 +64,15 @@ class TranslationService:
                     {"role": "system", "content": system_prompt},
                     {"role": "user", "content": user_prompt},
                 ],
-                "temperature": 0.3,
+                "max_tokens": 2048,
+                "temperature": 0.2,
             }
             logger.info(f"Calling OpenRouter with models fallback {unique_models} for translation...")
             response = httpx.post(
                 "https://openrouter.ai/api/v1/chat/completions",
                 headers=headers,
                 json=payload,
-                timeout=60.0,
+                timeout=45.0,
             )
             if response.status_code == 200:
                 data = response.json()

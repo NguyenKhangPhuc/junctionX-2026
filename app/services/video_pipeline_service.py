@@ -2,7 +2,7 @@
 
 import logging
 from pathlib import Path
-from typing import Optional
+from typing import Any, Callable, Dict, Optional
 
 from sqlalchemy.orm import Session
 
@@ -43,8 +43,17 @@ class VideoPipelineService:
         article_id: Optional[int] = None,
         voice: Optional[str] = None,
         tts_engine: str = "xtts",
+        progress_callback: Optional[Callable[[str, float, str, Optional[Dict[str, Any]]], None]] = None,
     ) -> VideoProcessResponse:
         """Execute the end-to-end video dubbing pipeline."""
+        def emit(stage: str, percent: float, msg: str, extra: Optional[Dict[str, Any]] = None):
+            if progress_callback:
+                try:
+                    progress_callback(stage, percent, msg, extra)
+                except Exception as cb_err:
+                    logger.debug(f"Progress callback exception: {cb_err}")
+
+        emit("init", 5.0, "Validating video file and checking media records...")
         resolved_video = self.resolve_media_path(video_path)
         if not resolved_video.exists():
             raise FileNotFoundError(f"Input video file not found at: {video_path}")
@@ -87,16 +96,19 @@ class VideoPipelineService:
         )
 
         if need_audio_extraction:
+            emit("audio", 12.0, "Extracting audio track from media (FFmpeg)...")
             logger.info(f"Extracting original default audio for video ID {video.id}...")
             raw_audio_path = ffmpeg_service.extract_audio(str(resolved_video))
             video.original_audio_path = raw_audio_path
             video.is_default_file = True
             db.commit()
             db.refresh(video)
+            emit("audio", 22.0, "Audio track extracted successfully.")
         else:
             logger.info(
                 f"Original audio already present for video ID {video.id}: {video.original_audio_path}"
             )
+            emit("audio", 22.0, "Original audio track already present.")
 
         # 3. Transcribe original speech (is_default_file = True)
         need_transcribe = (
@@ -110,6 +122,7 @@ class VideoPipelineService:
         )
 
         if need_transcribe:
+            emit("stt", 30.0, "Transcribing speech into time-coded segments (Whisper STT)...")
             logger.info(f"Transcribing original audio with VAD filter for video ID {video.id}...")
             stt_result = stt_service.transcribe_audio(video.original_audio_path)
             video.original_transcript_text = stt_result["full_text"]
@@ -117,8 +130,11 @@ class VideoPipelineService:
             video.original_language = stt_result["language"]
             db.commit()
             db.refresh(video)
+            seg_count = len(stt_result.get("segments") or [])
+            emit("stt", 45.0, f"Speech transcribed successfully ({seg_count} dialogue segments).")
         else:
             logger.info(f"Original transcript already exists for video ID {video.id}.")
+            emit("stt", 45.0, "Speech transcript already indexed.")
 
         # 4. Handle Dubbed Version (is_default_file = False)
         dubbed_version = (
@@ -157,6 +173,7 @@ class VideoPipelineService:
         )
 
         if need_translate:
+            emit("translate", 50.0, f"Translating transcript into {target_language.upper()} via LLM...")
             logger.info(
                 f"Translating transcript for video ID {video.id} from {video.original_language} to {target_language}..."
             )
@@ -171,10 +188,12 @@ class VideoPipelineService:
             dubbed_version.dubbed_video_path = None
             db.commit()
             db.refresh(dubbed_version)
+            emit("translate", 62.0, f"Transcript translated into {target_language.upper()} successfully.")
         else:
             logger.info(
                 f"Translated transcript already cached for video ID {video.id} in {target_language}."
             )
+            emit("translate", 62.0, f"Translated transcript already cached for {target_language.upper()}.")
 
         # If no spoken speech was detected at all, handle gracefully without crashing TTS
         if not (dubbed_version.transcript_text or "").strip():
@@ -186,6 +205,7 @@ class VideoPipelineService:
             dubbed_version.status = "completed"
             db.commit()
             db.refresh(dubbed_version)
+            emit("completed", 100.0, "No speech dialogue detected; original media retained.", {"video_id": video.id})
             return VideoProcessResponse(
                 video_id=video.id,
                 file_name=video.file_name,
@@ -227,6 +247,7 @@ class VideoPipelineService:
         )
 
         if need_tts:
+            emit("tts_prepare", 65.0, f"Configuring neural voice ({tts_engine}) for {target_language.upper()}...")
             logger.info(
                 f"Synthesizing dubbed speech for video ID {video.id} in {target_language} (engine: {tts_engine})..."
             )
@@ -266,10 +287,16 @@ class VideoPipelineService:
             )
 
             if has_segments:
+                total_segs = len(segments_to_synth)
                 logger.info(
-                    f"Synthesizing {len(segments_to_synth)} segments on timeline for video ID {video.id}..."
+                    f"Synthesizing {total_segs} segments on timeline for video ID {video.id}..."
                 )
                 clips_dir = ffmpeg_service.dubbed_audio_dir / f"clips_{video.id}_{target_language}"
+
+                def on_tts_progress(done_idx: int, total_idx: int):
+                    pct = 65.0 + (done_idx / max(total_idx, 1)) * 25.0
+                    emit("tts", min(pct, 90.0), f"Synthesizing dubbed voice segment {done_idx}/{total_idx} ({tts_engine})...")
+
                 clips = tts_service.synthesize_segments(
                     segments=segments_to_synth,
                     target_language=target_language,
@@ -278,6 +305,7 @@ class VideoPipelineService:
                     voice=voice,
                     engine=tts_engine,
                     gender=detected_gender,
+                    on_progress=on_tts_progress,
                 )
                 total_media_dur = video.duration or ffmpeg_service.get_media_duration(str(resolved_video))
                 dubbed_audio_path = ffmpeg_service.build_timeline_track(
@@ -288,6 +316,7 @@ class VideoPipelineService:
                     max_speedup=1.35,
                 )
             else:
+                emit("tts", 75.0, f"Synthesizing full text directly via {tts_engine}...")
                 logger.info(
                     f"No structured segments found for video ID {video.id}. Synthesizing full text directly..."
                 )
@@ -305,10 +334,12 @@ class VideoPipelineService:
             dubbed_version.dubbed_video_path = None
             db.commit()
             db.refresh(dubbed_version)
+            emit("tts", 90.0, "Dubbed speech synthesis complete. Audio track finalized.")
         else:
             logger.info(
                 f"Dubbed audio already present for video ID {video.id}: {dubbed_version.dubbed_audio_path}"
             )
+            emit("tts", 90.0, "Dubbed audio stream already exists on disk.")
 
         # 6. Merge dubbed audio into video
         need_merge = (
@@ -318,6 +349,7 @@ class VideoPipelineService:
         )
 
         if need_merge:
+            emit("merge", 92.0, "Multiplexing dubbed audio with video stream (FFmpeg)...")
             logger.info(
                 f"Merging dubbed audio into video for video ID {video.id}..."
             )
@@ -326,20 +358,25 @@ class VideoPipelineService:
                 / f"{video.id}_{target_language}_{resolved_video.stem}.mp4"
             )
             dubbed_video_path = ffmpeg_service.merge_audio_video(
-                video_path=video.file_path,
+                video_path=str(resolved_video),
                 audio_path=dubbed_version.dubbed_audio_path,
                 output_path=str(dubbed_video_dest),
             )
-            dubbed_version.dubbed_video_path = dubbed_video_path
+            stored_dubbed_path = f"/data/videos/dubbed/{dubbed_video_dest.name}"
+            dubbed_version.dubbed_video_path = stored_dubbed_path
             dubbed_version.status = "completed"
             db.commit()
             db.refresh(dubbed_version)
+            emit("merge", 98.0, "Video multiplexing complete.")
         else:
             logger.info(
                 f"Dubbed video already present for video ID {video.id}: {dubbed_version.dubbed_video_path}"
             )
             dubbed_version.status = "completed"
             db.commit()
+            emit("merge", 98.0, "Dubbed video stream verified.")
+
+        emit("completed", 100.0, f"Dubbed video in {target_language.upper()} generated successfully!", {"video_id": video.id})
 
         # Build response
         return VideoProcessResponse(

@@ -46,15 +46,28 @@ app = FastAPI(
 # CORS configuration
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:3000", "*"],
+    allow_origins=[
+        "http://localhost:3000",
+        "http://127.0.0.1:3000",
+    ],
+    allow_origin_regex=r"http://(localhost|127\.0\.0\.1)(:[0-9]+)?",
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# Register API routers under /api namespace
+from fastapi.staticfiles import StaticFiles
+
+# Register API routers under /api namespace and root for compatibility
 app.include_router(videos_router, prefix="/api")
 app.include_router(articles_router, prefix="/api")
+app.include_router(videos_router)
+app.include_router(articles_router)
+
+# Mount static media files directory for video streaming
+DATA_DIR = PROJECT_ROOT / "data"
+DATA_DIR.mkdir(parents=True, exist_ok=True)
+app.mount("/data", StaticFiles(directory=str(DATA_DIR)), name="data")
 
 
 @app.get("/health", tags=["system"])

@@ -1,9 +1,13 @@
+import json
 import logging
+import queue
 import shutil
+import threading
 from pathlib import Path
-from typing import List, Optional
+from typing import Any, Dict, List, Optional
 
 from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile, status
+from fastapi.responses import StreamingResponse
 from sqlalchemy.orm import Session, joinedload
 
 from app.models.video import Video
@@ -79,6 +83,82 @@ def process_video_endpoint(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Video pipeline failed: {exc}",
         ) from exc
+
+
+@router.post(
+    "/process-stream",
+    summary="Process and dub a video with real-time SSE progress streaming",
+    description="Streams real-time Server-Sent Events (SSE) indicating pipeline progress milestones, synthesis segments, and final VideoProcessResponse.",
+)
+def process_video_stream_endpoint(
+    request: VideoProcessRequest,
+    db: Session = Depends(get_db),
+):
+    """Trigger the video dubbing workflow and stream real-time progress via Server-Sent Events."""
+    def event_generator():
+        q: queue.Queue = queue.Queue()
+
+        def on_progress(stage: str, percent: float, message: str, extra: Optional[Dict[str, Any]] = None):
+            q.put({
+                "stage": stage,
+                "percent": round(percent, 1),
+                "message": message,
+                "data": extra,
+            })
+
+        def worker():
+            from app.utils.database import SessionLocal
+            with SessionLocal() as worker_db:
+                try:
+                    res = video_pipeline_service.process_video(
+                        db=worker_db,
+                        video_path=request.video_path,
+                        target_language=request.target_language,
+                        article_id=request.article_id,
+                        voice=request.voice,
+                        tts_engine=request.tts_engine,
+                        progress_callback=on_progress,
+                    )
+                    q.put({
+                        "stage": "completed",
+                        "percent": 100.0,
+                        "message": "Dubbing pipeline completed successfully!",
+                        "data": res.model_dump(mode="json"),
+                    })
+                except Exception as exc:
+                    logger.error(f"Error in dubbing pipeline stream worker: {exc}", exc_info=True)
+                    q.put({
+                        "stage": "error",
+                        "percent": 0.0,
+                        "error": str(exc),
+                    })
+                finally:
+                    q.put(None)  # Sentinel
+
+        thread = threading.Thread(target=worker, daemon=True)
+        thread.start()
+
+        while True:
+            try:
+                item = q.get(timeout=1.0)
+                if item is None:
+                    break
+                yield f"data: {json.dumps(item)}\n\n"
+            except queue.Empty:
+                # SSE keep-alive comment every second during long operations
+                yield ": keep-alive\n\n"
+
+        thread.join(timeout=5.0)
+
+    return StreamingResponse(
+        event_generator(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
+    )
 
 
 @router.get(
