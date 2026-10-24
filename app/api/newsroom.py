@@ -204,3 +204,31 @@ def reject_draft(
         "rejected_by": payload.editor_name,
         "editor_notes": notes,
     }
+
+@router.get("/published")
+def get_published_feed(db: Session = Depends(get_db)):
+    """Return all approved & rendered stories for the public OuluLens expat feed."""
+    order_col = getattr(VideoDubbedVersion, "updated_at", VideoDubbedVersion.id)
+    completed = (
+        db.query(VideoDubbedVersion)
+        .filter(VideoDubbedVersion.status == "completed")
+        .order_by(order_col.desc())
+        .all()
+    )
+    results = []
+    for dub in completed:
+        t_json = dub.transcript_json if isinstance(dub.transcript_json, dict) else {}
+        results.append({
+            "id": dub.id,
+            "video_id": dub.video_id,
+            "headline_en": t_json.get("headline_en", "Oulu News Update"),
+            "relevance_tag": t_json.get("relevance_tag", "Local Culture"),
+            "kaleva_user_need": t_json.get("kaleva_user_need", "Information"),
+            "transcript_text": dub.transcript_text,
+            "expat_explainer_box": t_json.get("expat_explainer_box", []),
+            "ai_disclosure": t_json.get("ai_disclosure", AI_DISCLOSURE_STATEMENT),
+            "approved_by": t_json.get("approved_by", "Kaleva Duty Editor"),
+            "dubbed_video_path": dub.dubbed_video_path,
+            "dubbed_audio_path": dub.dubbed_audio_path,
+        })
+    return results

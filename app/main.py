@@ -26,8 +26,14 @@ from app.api import community, newsroom
 from app.api.articles import router as articles_router
 from app.api.videos import router as videos_router
 
+from fastapi.staticfiles import StaticFiles
+import os
+
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("junction-backend")
+
+os.makedirs("data", exist_ok=True)
+app.mount("/data", StaticFiles(directory="data"), name="data")
 
 
 @asynccontextmanager
