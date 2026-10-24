@@ -78,3 +78,25 @@ class VideoDetailResponse(BaseModel):
     dubbed_versions: List[DubbedVersionResponse] = []
 
     model_config = ConfigDict(from_attributes=True)
+
+
+class DubbedLanguagesResponse(BaseModel):
+    """Response containing all available dubbed versions and supported language codes for a video."""
+
+    video_id: int
+    languages: List[str] = Field(default_factory=list, description="List of target language codes available")
+    dubbed_versions: List[DubbedVersionResponse] = Field(
+        default_factory=list, description="Full details of each dubbed version"
+    )
+
+    model_config = ConfigDict(from_attributes=True)
+
+
+class DubbedDeleteResponse(BaseModel):
+    """Response schema upon deleting a dubbed language version and its files."""
+
+    video_id: int
+    target_language: str
+    message: str
+    deleted_files: List[str] = Field(default_factory=list, description="List of deleted media file paths")
+

@@ -1,18 +1,23 @@
-"""API router for video processing, dubbing pipeline, and metadata retrieval."""
-
 import logging
-from typing import List
+import shutil
+from pathlib import Path
+from typing import List, Optional
 
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile, status
 from sqlalchemy.orm import Session, joinedload
 
 from app.models.video import Video
+from app.models.video_dubbed_version import VideoDubbedVersion
 from app.schemas.video import (
+    DubbedDeleteResponse,
+    DubbedLanguagesResponse,
+    DubbedVersionResponse,
     VideoDetailResponse,
     VideoProcessRequest,
     VideoProcessResponse,
 )
-from app.services.video_pipeline_service import video_pipeline_service
+from app.services.ffmpeg_service import ffmpeg_service
+from app.services.video_pipeline_service import VideoPipelineService, video_pipeline_service
 from app.utils.database import get_db
 
 logger = logging.getLogger(__name__)
@@ -130,3 +135,167 @@ def get_video_by_id(
         )
 
     return VideoDetailResponse.model_validate(video)
+
+
+@router.post(
+    "",
+    response_model=VideoDetailResponse,
+    status_code=status.HTTP_201_CREATED,
+    summary="Upload and register a new video",
+    description="Uploads a video file, saves it to /data/videos/raw/, probes its duration, and creates a database record.",
+)
+def create_video_endpoint(
+    file: UploadFile = File(..., description="Target video media file to upload"),
+    article_id: Optional[int] = Form(None, description="Optional article ID to associate with this video"),
+    original_language: str = Form("vi", description="Source spoken language code"),
+    db: Session = Depends(get_db),
+) -> VideoDetailResponse:
+    """Upload a raw video file and register a Video entity."""
+    try:
+        # 1. Determine destination path on disk
+        safe_filename = Path(file.filename).name
+        dest_dir = Path(__file__).resolve().parent.parent.parent / "data" / "videos" / "raw"
+        dest_dir.mkdir(parents=True, exist_ok=True)
+        dest_file = dest_dir / safe_filename
+
+        # 2. Write uploaded chunks to disk
+        with dest_file.open("wb") as buffer:
+            shutil.copyfileobj(file.file, buffer)
+
+        logger.info(f"Saved uploaded video file to disk: {dest_file}")
+
+        # 3. Probe video duration
+        duration = ffmpeg_service.get_media_duration(str(dest_file))
+
+        # 4. Format path as requested: /data/videos/raw/...
+        stored_path = f"/data/videos/raw/{safe_filename}"
+
+        # 5. Persist Video entity
+        video = Video(
+            file_name=safe_filename,
+            file_path=stored_path,
+            duration=duration,
+            original_language=original_language,
+            article_id=article_id,
+            is_default_file=True,
+        )
+        db.add(video)
+        db.commit()
+        db.refresh(video)
+
+        logger.info(f"Registered video ID {video.id} with path {stored_path} (duration: {duration:.2f}s).")
+        return VideoDetailResponse.model_validate(video)
+    except Exception as exc:
+        db.rollback()
+        logger.error(f"Failed to upload video: {exc}", exc_info=True)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Video upload failed: {exc}",
+        ) from exc
+
+
+@router.get(
+    "/{video_id}/dubbed",
+    response_model=DubbedLanguagesResponse,
+    summary="Get all dubbed versions of a video",
+    description="Retrieve all dubbed language versions and supported language codes for a given video.",
+)
+def get_video_dubbed_versions(
+    video_id: int,
+    db: Session = Depends(get_db),
+) -> DubbedLanguagesResponse:
+    """Retrieve all dubbed versions and supported language codes for a video."""
+    video = db.query(Video).filter(Video.id == video_id).first()
+    if video is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Video with ID {video_id} not found.",
+        )
+
+    dubbed_versions = (
+        db.query(VideoDubbedVersion)
+        .filter(VideoDubbedVersion.video_id == video_id)
+        .order_by(VideoDubbedVersion.created_at.asc())
+        .all()
+    )
+
+    languages = list(dict.fromkeys([d.target_language for d in dubbed_versions]))
+    return DubbedLanguagesResponse(
+        video_id=video.id,
+        languages=languages,
+        dubbed_versions=[DubbedVersionResponse.model_validate(d) for d in dubbed_versions],
+    )
+
+
+@router.delete(
+    "/{video_id}/dubbed/{target_language}",
+    response_model=DubbedDeleteResponse,
+    summary="Delete a dubbed video version",
+    description="Deletes a specific dubbed version by target language, removing database records and deleting physical video and audio files from disk.",
+)
+def delete_video_dubbed_version(
+    video_id: int,
+    target_language: str,
+    db: Session = Depends(get_db),
+) -> DubbedDeleteResponse:
+    """Delete a dubbed version and its underlying media files."""
+    video = db.query(Video).filter(Video.id == video_id).first()
+    if video is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Video with ID {video_id} not found.",
+        )
+
+    dubbed_version = (
+        db.query(VideoDubbedVersion)
+        .filter(
+            VideoDubbedVersion.video_id == video_id,
+            VideoDubbedVersion.target_language == target_language,
+        )
+        .first()
+    )
+    if dubbed_version is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Dubbed version for language '{target_language}' not found for video ID {video_id}.",
+        )
+
+    deleted_files = []
+
+    # 1. Delete dubbed video file
+    if dubbed_version.dubbed_video_path:
+        resolved_video_file = VideoPipelineService.resolve_media_path(dubbed_version.dubbed_video_path)
+        if resolved_video_file.exists() and resolved_video_file.is_file():
+            resolved_video_file.unlink(missing_ok=True)
+            deleted_files.append(str(resolved_video_file))
+            logger.info(f"Deleted dubbed video file: {resolved_video_file}")
+
+    # 2. Delete dubbed audio file
+    if dubbed_version.dubbed_audio_path:
+        resolved_audio_file = VideoPipelineService.resolve_media_path(dubbed_version.dubbed_audio_path)
+        if resolved_audio_file.exists() and resolved_audio_file.is_file():
+            resolved_audio_file.unlink(missing_ok=True)
+            deleted_files.append(str(resolved_audio_file))
+            logger.info(f"Deleted dubbed audio file: {resolved_audio_file}")
+
+    # 3. Delete temporary clips folder if present
+    clips_dir = ffmpeg_service.dubbed_audio_dir / f"clips_{video_id}_{target_language}"
+    if clips_dir.exists() and clips_dir.is_dir():
+        shutil.rmtree(clips_dir, ignore_errors=True)
+        deleted_files.append(str(clips_dir))
+        logger.info(f"Deleted temporary clips folder: {clips_dir}")
+
+    # 4. Remove database record
+    db.delete(dubbed_version)
+    db.commit()
+
+    logger.info(
+        f"Dubbed version for language '{target_language}' of video ID {video_id} deleted successfully."
+    )
+    return DubbedDeleteResponse(
+        video_id=video_id,
+        target_language=target_language,
+        message=f"Dubbed version for language '{target_language}' and associated media files deleted successfully.",
+        deleted_files=deleted_files,
+    )
+

@@ -1,9 +1,10 @@
 """Article model representing published or community articles."""
 
 from datetime import datetime
-from typing import TYPE_CHECKING, List, Optional
+from typing import TYPE_CHECKING, Any, List, Optional
 
-from sqlalchemy import DateTime, Integer, String, Text, func
+from pgvector.sqlalchemy import Vector
+from sqlalchemy import DateTime, Index, Integer, String, Text, func
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.utils.database import Base
@@ -13,7 +14,7 @@ if TYPE_CHECKING:
 
 
 class Article(Base):
-    """Article entity containing text content, language, and associated media."""
+    """Article entity containing text content, language, embedding, and associated media."""
 
     __tablename__ = "articles"
 
@@ -22,6 +23,7 @@ class Article(Base):
     content: Mapped[str] = mapped_column(Text, nullable=False)
     original_language: Mapped[str] = mapped_column(String(10), default="vi", nullable=False)
     author: Mapped[Optional[str]] = mapped_column(String(100), nullable=True)
+    embedding: Mapped[Optional[Any]] = mapped_column(Vector(1024), nullable=True)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), nullable=False
     )
@@ -30,3 +32,15 @@ class Article(Base):
     videos: Mapped[List["Video"]] = relationship(
         "Video", back_populates="article", cascade="all, delete-orphan"
     )
+
+    # Indexing
+    __table_args__ = (
+        Index(
+            "ix_articles_embedding_hnsw",
+            "embedding",
+            postgresql_using="hnsw",
+            postgresql_with={"m": 16, "ef_construction": 64},
+            postgresql_ops={"embedding": "vector_cosine_ops"},
+        ),
+    )
+

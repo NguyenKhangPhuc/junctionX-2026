@@ -21,6 +21,7 @@ import uvicorn
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
+from app.api.articles import router as articles_router
 from app.api.videos import router as videos_router
 
 logging.basicConfig(level=logging.INFO)
@@ -53,6 +54,7 @@ app.add_middleware(
 
 # Register API routers under /api namespace
 app.include_router(videos_router, prefix="/api")
+app.include_router(articles_router, prefix="/api")
 
 
 @app.get("/health", tags=["system"])

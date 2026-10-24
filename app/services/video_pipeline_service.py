@@ -20,6 +20,21 @@ logger = logging.getLogger(__name__)
 class VideoPipelineService:
     """End-to-end pipeline service for processing videos, extracting audio, transcribing, translating, and dubbing."""
 
+    @staticmethod
+    def resolve_media_path(path_str: str) -> Path:
+        """Resolve a media path string, supporting absolute, project-relative, and root-formatted paths."""
+        p = Path(path_str)
+        if p.exists():
+            return p.resolve()
+        repo_root = Path(__file__).resolve().parent.parent.parent
+        root_rel = (repo_root / path_str.lstrip("/")).resolve()
+        if root_rel.exists():
+            return root_rel
+        cwd_rel = Path(path_str.lstrip("/")).resolve()
+        if cwd_rel.exists():
+            return cwd_rel
+        return p.resolve()
+
     def process_video(
         self,
         db: Session,
@@ -29,37 +44,19 @@ class VideoPipelineService:
         voice: Optional[str] = None,
         tts_engine: str = "xtts",
     ) -> VideoProcessResponse:
-        """Execute the end-to-end video dubbing pipeline.
-
-        1. Verify video exists and register or retrieve Video entity.
-        2. Extract original audio (is_default_file=True) using FFmpeg if not already present.
-        3. Transcribe speech using faster-whisper (is_default_file=True).
-        4. Translate transcript to target_language using LLM (is_default_file=False).
-        5. Synthesize translated speech using edge-tts.
-        6. Merge translated audio with source video using FFmpeg.
-
-        Args:
-            db: Active SQLAlchemy database session.
-            video_path: Path to the local video file.
-            target_language: ISO language code to translate and dub into.
-            article_id: Optional ID of the parent article.
-            voice: Optional TTS voice override.
-
-        Returns:
-            VideoProcessResponse: Complete details of original and dubbed assets.
-
-        Raises:
-            FileNotFoundError: If the source video path does not exist.
-            RuntimeError: If any pipeline step fails.
-        """
-        resolved_video = Path(video_path).resolve()
+        """Execute the end-to-end video dubbing pipeline."""
+        resolved_video = self.resolve_media_path(video_path)
         if not resolved_video.exists():
             raise FileNotFoundError(f"Input video file not found at: {video_path}")
 
-        # 1. Register or find Video record
+        # 1. Register or find Video record (checking both stored path formats)
         video = (
             db.query(Video)
-            .filter(Video.file_path == str(resolved_video))
+            .filter(
+                (Video.file_path == str(resolved_video))
+                | (Video.file_path == video_path)
+                | (Video.file_path == f"/data/videos/raw/{resolved_video.name}")
+            )
             .first()
         )
 
