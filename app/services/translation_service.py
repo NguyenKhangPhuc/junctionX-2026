@@ -12,15 +12,37 @@ load_dotenv()
 
 logger = logging.getLogger(__name__)
 
+OULU_EXPLANATORY_SYSTEM_PROMPT = """
+You are a senior bilingual news editor at Kaleva Media serving international tech workers and their families in Oulu, Finland.
+Follow Finland's JSN Journalistic Guidelines: strictly separate verified facts from context, never invent policies, and cite sources.
+
+Given a Finnish news item and optional Oulu City API data, return ONLY valid JSON matching this exact schema:
+{
+  "headline_en": "Translated, clear headline",
+  "relevance_tag": "One of: [Family & Daycare, Housing & Energy, Transport & Winter, Healthcare & Kela, Work & Tax, Local Culture]",
+  "spoken_narration_segments": [
+    {"start": 0.0, "end": 6.0, "text": "Clear spoken English for video/audio dubbing..."}
+  ],
+  "expat_explainer_box": [
+    {
+      "finnish_term": "e.g., Varhaiskasvatus / Wilma / Talvikunnossapito",
+      "what_it_means_for_you": "Plain-English explanation of how an international family in Oulu should act on this."
+    }
+  ]
+}
+"""
+
 
 class TranslationService:
     """Service translating text and structured time-coded segments using LLMs."""
 
     def __init__(self):
         self.openrouter_api_key = os.getenv("OPENROUTER_API_KEY")
-        self.openrouter_model = os.getenv("OPENROUTER_MODEL", "meta-llama/llama-3.3-70b-instruct:free")
+        self.openrouter_model = os.getenv(
+            "OPENROUTER_MODEL", "meta-llama/llama-3.3-70b-instruct:free"
+        )
         self.ollama_host = os.getenv("OLLAMA_HOST", "http://127.0.0.1:11434")
-        self.ollama_model = os.getenv("LLM_MODEL", "llama3.2")
+        self.ollama_model = os.getenv("LLM_MODEL") or "llama3.2"
 
     @property
     def api_key(self) -> Optional[str]:
@@ -32,7 +54,9 @@ class TranslationService:
         """Dynamic lookup for OpenRouter Model."""
         return os.getenv("OPENROUTER_MODEL") or self.openrouter_model
 
-    def _call_openrouter(self, system_prompt: str, user_prompt: str) -> Tuple[Optional[str], Optional[str]]:
+    def _call_openrouter(
+        self, system_prompt: str, user_prompt: str
+    ) -> Tuple[Optional[str], Optional[str]]:
         """Call OpenRouter API using OpenAI SDK format via httpx.
 
         Returns:
@@ -67,7 +91,9 @@ class TranslationService:
                 ],
                 "temperature": 0.3,
             }
-            logger.info(f"Calling OpenRouter with models fallback {unique_models} for translation...")
+            logger.info(
+                f"Calling OpenRouter with models fallback {unique_models} for translation..."
+            )
             response = httpx.post(
                 "https://openrouter.ai/api/v1/chat/completions",
                 headers=headers,
@@ -88,7 +114,9 @@ class TranslationService:
     def _call_ollama(self, system_prompt: str, user_prompt: str) -> str:
         """Fallback to local Ollama instance."""
         try:
-            logger.info(f"Calling local Ollama model '{self.ollama_model}' at {self.ollama_host}...")
+            logger.info(
+                f"Calling local Ollama model '{self.ollama_model}' at {self.ollama_host}..."
+            )
             payload = {
                 "model": self.ollama_model,
                 "messages": [
@@ -126,7 +154,96 @@ class TranslationService:
                 raise RuntimeError(
                     f"All LLM translation backends failed. OpenRouter error: {openrouter_error} | Ollama error: {ollama_err}"
                 ) from ollama_err
-            raise RuntimeError(f"All LLM translation backends failed. {ollama_err}") from ollama_err
+            raise RuntimeError(
+                f"All LLM translation backends failed. {ollama_err}"
+            ) from ollama_err
+
+    @staticmethod
+    def _strip_code_fences(raw_text: str) -> str:
+        """Remove markdown code fences around JSON output."""
+        cleaned = raw_text.strip()
+        if cleaned.startswith("```json"):
+            cleaned = cleaned[7:]
+        elif cleaned.startswith("```"):
+            cleaned = cleaned[3:]
+        if cleaned.endswith("```"):
+            cleaned = cleaned[:-3]
+        return cleaned.strip()
+
+    def generate_oulu_explanatory_digest(
+        self,
+        finnish_text: str,
+        ouka_context: str = "",
+        segments: Optional[List[Dict[str, Any]]] = None,
+        target_lang: str = "en",
+    ) -> Tuple[str, Dict[str, Any]]:
+        """Generate structured Oulu explanatory JSON and narration text for international residents.
+
+        Returns:
+            Tuple[str, Dict[str, Any]]: (joined_spoken_narration_text, structured_json_dict)
+        """
+        user_payload = {
+            "target_language": target_lang,
+            "finnish_news_item": finnish_text,
+            "oulu_city_api_context": ouka_context or "General Oulu municipal jurisdiction.",
+            "source_segments": segments or [],
+        }
+        user_prompt = json.dumps(user_payload, ensure_ascii=False)
+
+        try:
+            raw_response = self._call_llm(
+                OULU_EXPLANATORY_SYSTEM_PROMPT.strip(), user_prompt
+            )
+            cleaned = self._strip_code_fences(raw_response)
+            parsed = json.loads(cleaned)
+
+            if isinstance(parsed, dict):
+                narration_segments = parsed.get("spoken_narration_segments") or []
+                if not isinstance(narration_segments, list) or not narration_segments:
+                    narration_segments = [
+                        {
+                            "start": 0.0,
+                            "end": 10.0,
+                            "text": str(parsed.get("headline_en") or finnish_text),
+                        }
+                    ]
+                    parsed["spoken_narration_segments"] = narration_segments
+
+                full_narration = " ".join(
+                    str(seg.get("text", "")).strip()
+                    for seg in narration_segments
+                    if isinstance(seg, dict) and seg.get("text")
+                ).strip()
+
+                parsed.setdefault("headline_en", "Oulu Local News Update")
+                parsed.setdefault("relevance_tag", "Local Culture")
+                parsed.setdefault("expat_explainer_box", [])
+
+                return full_narration, parsed
+        except Exception as e:
+            logger.warning(
+                f"Explanatory JSON generation failed ({e}). Using fallback digest structure..."
+            )
+
+        # Fallback if LLM returns non-JSON or fails
+        fallback_segments = segments or [{"start": 0.0, "end": 8.0, "text": finnish_text}]
+        trans_text, trans_segs = self.translate_segments(
+            segments=fallback_segments, source_lang="fi", target_lang=target_lang
+        )
+        fallback_payload = {
+            "headline_en": trans_text[:100] if trans_text else "Oulu News Digest",
+            "relevance_tag": "Local Culture",
+            "spoken_narration_segments": trans_segs,
+            "expat_explainer_box": [
+                {
+                    "finnish_term": "Oulun kaupunki (City of Oulu)",
+                    "what_it_means_for_you": (
+                        f"Municipal context from api.ouka.fi: {ouka_context or 'Check ouka.fi for local city services.'}"
+                    ),
+                }
+            ],
+        }
+        return trans_text, fallback_payload
 
     def translate_segments(
         self,
@@ -138,14 +255,6 @@ class TranslationService:
 
         Preserves start/end timestamps and returns both the translated continuous text
         and updated segment list.
-
-        Args:
-            segments: List of segment dicts with {"start": float, "end": float, "text": str}.
-            source_lang: Source language code (e.g., 'vi', 'en').
-            target_lang: Target language code (e.g., 'en', 'vi').
-
-        Returns:
-            Tuple[str, List[Dict[str, Any]]]: (full_translated_text, translated_segments).
         """
         if not segments:
             return "", []
@@ -169,23 +278,13 @@ class TranslationService:
 
         try:
             raw_response = self._call_llm(system_prompt, user_prompt)
-
-            # Strip possible markdown code blocks if the LLM wrapped it
-            cleaned = raw_response.strip()
-            if cleaned.startswith("```json"):
-                cleaned = cleaned[7:]
-            elif cleaned.startswith("```"):
-                cleaned = cleaned[3:]
-            if cleaned.endswith("```"):
-                cleaned = cleaned[:-3]
-            cleaned = cleaned.strip()
+            cleaned = self._strip_code_fences(raw_response)
 
             parsed = json.loads(cleaned)
             if isinstance(parsed, list) and len(parsed) > 0:
                 translated_segments = []
                 translated_texts = []
                 for idx, orig in enumerate(segments):
-                    # Ensure matching segment timestamps
                     if idx < len(parsed):
                         text = str(parsed[idx].get("text", orig["text"])).strip()
                     else:
@@ -208,12 +307,17 @@ class TranslationService:
                 f"Structured JSON translation failed ({e}). Falling back to whole text translation..."
             )
 
-        # Fallback: Translate full text
+        # Fallback: Translate full text (guarded so offline LLM doesn't crash ingestion)
         full_source = " ".join([s["text"] for s in segments])
         fb_sys = f"Translate the following text from {source_lang} to {target_lang}. Output only the translation."
-        full_translated_text = self._call_llm(fb_sys, full_source).strip()
+        try:
+            full_translated_text = self._call_llm(fb_sys, full_source).strip()
+        except Exception as fallback_err:
+            logger.warning(
+                f"Fallback LLM call unavailable ({fallback_err}); retaining original text for human editor review."
+            )
+            full_translated_text = f"[Draft awaiting editor translation] {full_source}"
 
-        # Update text across segments proportionally or use full text
         translated_segments = [
             {"start": s["start"], "end": s["end"], "text": s["text"]} for s in segments
         ]

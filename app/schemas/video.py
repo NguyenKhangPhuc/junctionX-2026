@@ -1,7 +1,7 @@
 """Pydantic schemas for Video and Dubbing requests and responses."""
 
 from datetime import datetime
-from typing import Any, List, Optional
+from typing import Any, Dict, List, Optional, Union
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -34,7 +34,7 @@ class DubbedVersionResponse(BaseModel):
     video_id: int
     target_language: str
     transcript_text: Optional[str] = None
-    transcript_json: Optional[List[dict[str, Any]]] = None
+    transcript_json: Optional[Union[List[Dict[str, Any]], Dict[str, Any]]] = None
     dubbed_audio_path: Optional[str] = None
     dubbed_video_path: Optional[str] = None
     status: str
@@ -54,7 +54,7 @@ class VideoProcessResponse(BaseModel):
     duration: Optional[float] = None
     original_language: str
     original_transcript_text: Optional[str] = None
-    original_transcript_json: Optional[List[dict[str, Any]]] = None
+    original_transcript_json: Optional[Union[List[Dict[str, Any]], Dict[str, Any]]] = None
     is_default_file: bool = True
     dubbed_version: DubbedVersionResponse
 
@@ -72,7 +72,7 @@ class VideoDetailResponse(BaseModel):
     duration: Optional[float] = None
     original_language: str
     original_transcript_text: Optional[str] = None
-    original_transcript_json: Optional[List[dict[str, Any]]] = None
+    original_transcript_json: Optional[Union[List[Dict[str, Any]], Dict[str, Any]]] = None
     is_default_file: bool = True
     created_at: datetime
     dubbed_versions: List[DubbedVersionResponse] = []
@@ -99,4 +99,3 @@ class DubbedDeleteResponse(BaseModel):
     target_language: str
     message: str
     deleted_files: List[str] = Field(default_factory=list, description="List of deleted media file paths")
-

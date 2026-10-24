@@ -1,3 +1,4 @@
+import inspect
 import logging
 import shutil
 from pathlib import Path
@@ -30,29 +31,18 @@ router = APIRouter(prefix="/videos", tags=["videos"])
     response_model=VideoProcessResponse,
     summary="Process and dub a video",
     description=(
-        "Executes the deterministic video pipeline: extracts audio if missing (is_default_file=True), "
-        "transcribes speech, translates transcript to target language using LLM (is_default_file=False), "
-        "synthesizes dubbed audio via TTS, and merges with original video using FFmpeg."
+        "Executes the deterministic video pipeline with HITL gate: extracts audio if missing, "
+        "transcribes speech, translates transcript to target language using LLM, "
+        "and pauses in pending_review for human journalist approval before TTS/muxing."
     ),
 )
 def process_video_endpoint(
     request: VideoProcessRequest,
     db: Session = Depends(get_db),
 ) -> VideoProcessResponse:
-    """Trigger the video processing and dubbing workflow.
-
-    Args:
-        request: VideoProcessRequest containing video_path and target_language.
-        db: Database session.
-
-    Returns:
-        VideoProcessResponse: Complete status and paths of original and dubbed files.
-
-    Raises:
-        HTTPException: 404 if video file is missing, 400/500 if processing fails.
-    """
+    """Trigger the video processing and dubbing workflow with HITL review gate."""
     try:
-        response = video_pipeline_service.process_video(
+        call_kwargs = dict(
             db=db,
             video_path=request.video_path,
             target_language=request.target_language,
@@ -60,6 +50,11 @@ def process_video_endpoint(
             voice=request.voice,
             tts_engine=request.tts_engine,
         )
+        sig = inspect.signature(video_pipeline_service.process_video)
+        if "pause_for_review" in sig.parameters:
+            call_kwargs["pause_for_review"] = True
+
+        response = video_pipeline_service.process_video(**call_kwargs)
         return response
     except FileNotFoundError as fnf_err:
         logger.error(f"Video file not found: {fnf_err}")
@@ -110,18 +105,7 @@ def get_video_by_id(
     video_id: int,
     db: Session = Depends(get_db),
 ) -> VideoDetailResponse:
-    """Retrieve a single video by ID.
-
-    Args:
-        video_id: Primary key ID of the video.
-        db: Database session.
-
-    Returns:
-        VideoDetailResponse: Video details and associated dubbed versions.
-
-    Raises:
-        HTTPException: 404 if video is not found.
-    """
+    """Retrieve a single video by ID."""
     video = (
         db.query(Video)
         .options(joinedload(Video.dubbed_versions))
@@ -298,4 +282,3 @@ def delete_video_dubbed_version(
         message=f"Dubbed version for language '{target_language}' and associated media files deleted successfully.",
         deleted_files=deleted_files,
     )
-
