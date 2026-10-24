@@ -13,6 +13,7 @@ from app.schemas.article import (
     ArticleSearchResponse,
     ArticleSearchResultItem,
 )
+from app.schemas.video import VideoDetailResponse
 from app.services.embedding_service import embedding_service
 from app.utils.database import get_db
 
@@ -259,8 +260,61 @@ def get_article_by_id(
         author=article.author,
         has_embedding=article.embedding is not None,
         created_at=article.created_at,
-        videos=article.videos,
+        videos=[VideoDetailResponse.model_validate(v) for v in (article.videos or [])],
     )
+
+
+@router.put(
+    "/{article_id}",
+    response_model=ArticleResponse,
+    status_code=status.HTTP_200_OK,
+    summary="Update article",
+    description="Updates article metadata and recalculates its semantic text embedding.",
+)
+def update_article(
+    article_id: int,
+    payload: ArticleCreate,
+    db: Session = Depends(get_db),
+) -> ArticleResponse:
+    """Update an existing article and re-compute its vector embedding."""
+    article = db.query(Article).filter(Article.id == article_id).first()
+    if article is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Article with ID {article_id} not found.",
+        )
+
+    try:
+        article.title = payload.title
+        article.content = payload.content
+        article.original_language = payload.original_language
+        article.author = payload.author
+
+        text_to_embed = f"{payload.title}\n{payload.content}"
+        embedding_vector = embedding_service.generate_embedding(text_to_embed)
+        if embedding_vector is not None:
+            article.embedding = embedding_vector
+
+        db.commit()
+        db.refresh(article)
+        logger.info(f"Article ID {article_id} updated successfully.")
+
+        return ArticleResponse(
+            id=article.id,
+            title=article.title,
+            content=article.content,
+            original_language=article.original_language,
+            author=article.author,
+            has_embedding=article.embedding is not None,
+            created_at=article.created_at,
+        )
+    except Exception as e:
+        db.rollback()
+        logger.error(f"Failed to update article {article_id}: {e}", exc_info=True)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to update article: {e}",
+        ) from e
 
 
 @router.delete(

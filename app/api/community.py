@@ -1,14 +1,17 @@
-# app/api/community.py
+"""FastAPI router for two-way community engagement, voting, error flagging, and Reverse-Bridge pitches."""
+
 import asyncio
 import json
+
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
 from sqlalchemy.orm.attributes import flag_modified
-from app.utils.database import get_db
+
 from app.models.article import Article
 from app.models.video_dubbed_version import VideoDubbedVersion
 from app.services.community_service import CommunityService
+from app.utils.database import get_db
 
 router = APIRouter(tags=["Community Co-Creation"])
 
@@ -27,19 +30,22 @@ class ErrorFlagPayload(BaseModel):
 
 
 @router.post("/questions")
-def submit_question_or_tip(payload: CommunityQuestionCreate, db: Session = Depends(get_db)):
+def submit_question_or_tip(
+    payload: CommunityQuestionCreate, db: Session = Depends(get_db)
+):
     meta = {
         "question_text": payload.question_text,
         "persona_tag": payload.persona_tag,
         "upvotes": 1,
         "status": "open_for_voting",
-        "ai_draft": None
+        "ai_draft": None,
+        "finnish_newsroom_pitch": None,
     }
     row = Article(
         title=payload.title,
         content=json.dumps(meta),
         original_language=payload.language,
-        author="COMMUNITY_QUESTION"
+        author="COMMUNITY_QUESTION",
     )
     db.add(row)
     db.commit()
@@ -48,6 +54,7 @@ def submit_question_or_tip(payload: CommunityQuestionCreate, db: Session = Depen
 
 
 @router.get("/questions")
+@router.get("/topics/vote")
 def list_community_questions(db: Session = Depends(get_db)):
     rows = db.query(Article).filter(Article.author == "COMMUNITY_QUESTION").all()
     results = []
@@ -55,13 +62,19 @@ def list_community_questions(db: Session = Depends(get_db)):
         try:
             meta = json.loads(r.content)
         except Exception:
-            meta = {"question_text": r.content, "upvotes": 0, "status": "open_for_voting"}
-        results.append({
-            "id": r.id,
-            "title": r.title,
-            "created_at": r.created_at,
-            **meta
-        })
+            meta = {
+                "question_text": r.content,
+                "upvotes": 0,
+                "status": "open_for_voting",
+            }
+        results.append(
+            {
+                "id": r.id,
+                "title": r.title,
+                "created_at": r.created_at,
+                **meta,
+            }
+        )
     # Sort highest upvoted first so the community sets the newsroom agenda
     results.sort(key=lambda x: x.get("upvotes", 0), reverse=True)
     return results
@@ -69,17 +82,25 @@ def list_community_questions(db: Session = Depends(get_db)):
 
 @router.post("/questions/{question_id}/upvote")
 def upvote_question(question_id: int, db: Session = Depends(get_db)):
-    row = db.query(Article).filter(
-        Article.id == question_id,
-        Article.author == "COMMUNITY_QUESTION"
-    ).first()
+    row = (
+        db.query(Article)
+        .filter(
+            Article.id == question_id,
+            Article.author == "COMMUNITY_QUESTION",
+        )
+        .first()
+    )
     if not row:
         raise HTTPException(status_code=404, detail="Community question not found")
 
     try:
         meta = json.loads(row.content)
     except Exception:
-        meta = {"question_text": row.content, "upvotes": 0, "status": "open_for_voting"}
+        meta = {
+            "question_text": row.content,
+            "upvotes": 0,
+            "status": "open_for_voting",
+        }
 
     meta["upvotes"] = meta.get("upvotes", 0) + 1
     row.content = json.dumps(meta)
@@ -96,16 +117,49 @@ def upvote_question(question_id: int, db: Session = Depends(get_db)):
             "draft": draft,
         }
 
-    return {"id": row.id, "upvotes": meta["upvotes"], "auto_drafted_for_editor": False}
+    return {
+        "id": row.id,
+        "upvotes": meta["upvotes"],
+        "auto_drafted_for_editor": False,
+    }
+
+
+@router.post("/questions/{question_id}/pitch-to-kaleva")
+def pitch_question_to_finnish_newsroom(
+    question_id: int, db: Session = Depends(get_db)
+):
+    """Reverse-Bridge Agent: Translate an English/international community issue into a Finnish story pitch for Kaleva."""
+    row = (
+        db.query(Article)
+        .filter(
+            Article.id == question_id,
+            Article.author == "COMMUNITY_QUESTION",
+        )
+        .first()
+    )
+    if not row:
+        raise HTTPException(status_code=404, detail="Community question not found")
+
+    service = CommunityService(db)
+    pitch = service.generate_finnish_newsroom_pitch(question_id)
+    return {
+        "question_id": row.id,
+        "original_title": row.title,
+        "finnish_newsroom_pitch": pitch,
+    }
 
 
 @router.post("/videos/{dub_id}/flag-error")
 def flag_translation_or_fact_error(
     dub_id: int,
     payload: ErrorFlagPayload,
-    db: Session = Depends(get_db)
+    db: Session = Depends(get_db),
 ):
-    dub = db.query(VideoDubbedVersion).filter(VideoDubbedVersion.id == dub_id).first()
+    dub = (
+        db.query(VideoDubbedVersion)
+        .filter(VideoDubbedVersion.id == dub_id)
+        .first()
+    )
     if not dub:
         raise HTTPException(status_code=404, detail="Dubbed version not found")
 
@@ -115,11 +169,13 @@ def flag_translation_or_fact_error(
         current_json = {"segments": list(dub.transcript_json or [])}
 
     flags = list(current_json.get("community_flags", []))
-    flags.append({
-        "flagged_segment": payload.flagged_segment,
-        "correction_note": payload.correction_note,
-        "reporter": payload.reporter_persona
-    })
+    flags.append(
+        {
+            "flagged_segment": payload.flagged_segment,
+            "correction_note": payload.correction_note,
+            "reporter": payload.reporter_persona,
+        }
+    )
     current_json["community_flags"] = flags
 
     dub.transcript_json = current_json
@@ -132,14 +188,16 @@ def flag_translation_or_fact_error(
     return {
         "dub_id": dub.id,
         "new_status": dub.status,
-        "message": "Video pulled back to the Kaleva Editor Queue for human verification."
+        "message": "Video pulled back to the Kaleva Editor Queue for human verification.",
     }
 
 
 @router.post("/seed-demo")
 def seed_demo_questions(db: Session = Depends(get_db)):
     """Seed 3 realistic Oulu community questions for live demo (idempotent)."""
-    existing = db.query(Article).filter(Article.author == "COMMUNITY_QUESTION").count()
+    existing = (
+        db.query(Article).filter(Article.author == "COMMUNITY_QUESTION").count()
+    )
     if existing > 0:
         return {"seeded": 0, "message": "Demo questions already exist."}
 
@@ -157,14 +215,22 @@ def seed_demo_questions(db: Session = Depends(get_db)):
                 "status": "pending_review",
                 "ai_draft": {
                     "headline_en": "Applying for English Daycare (Varhaiskasvatus) in Linnanmaa",
+                    "relevance_tag": "Family & Daycare",
                     "kaleva_user_need": "Usefulness",
+                    "high_stakes_warning": False,
                     "draft_answer_script": (
                         "Welcome to Oulu! Municipal early childhood education, known in Finnish as "
                         "Varhaiskasvatus, should normally be applied for four months in advance, "
-                        "or within two weeks if you suddenly start employment."
+                        "or within two weeks if you suddenly start employment or studies."
                     ),
+                    "expat_explainer_box": [
+                        {
+                            "finnish_term": "Varhaiskasvatus (Early Childhood Education)",
+                            "what_it_means_for_you": "Apply via the eVaka Oulu portal. Sudden employment reduces the statutory processing time from 4 months to 2 weeks.",
+                        }
+                    ],
                     "sources_used": ["api.ouka.fi", "Kaleva Municipal Desk"],
-                    "journalist_verification_note": "Verify current Linnanmaa English group capacity."
+                    "journalist_verification_note": "Verify current Linnanmaa English group capacity.",
                 },
             },
         },
@@ -180,14 +246,22 @@ def seed_demo_questions(db: Session = Depends(get_db)):
                 "status": "pending_review",
                 "ai_draft": {
                     "headline_en": "How Oulu Prioritizes Baana Winter Cycling Maintenance",
+                    "relevance_tag": "Transport & Winter",
                     "kaleva_user_need": "Information",
+                    "high_stakes_warning": False,
                     "draft_answer_script": (
                         "Oulu's winter maintenance—Talvikunnossapito—prioritizes Class 1A Baana "
                         "corridors whenever snow exceeds two centimeters, ensuring the Linnanmaa "
                         "university route is cleared before morning rush hour."
                     ),
+                    "expat_explainer_box": [
+                        {
+                            "finnish_term": "Talvikunnossapito & Baana",
+                            "what_it_means_for_you": "Class 1A main cycling highways are plowed and gritted before 7:00 AM on weekdays.",
+                        }
+                    ],
                     "sources_used": ["api.ouka.fi", "Kaleva Traffic Archive"],
-                    "journalist_verification_note": "Confirm 2026 Class 1A contractor map."
+                    "journalist_verification_note": "Confirm 2026 Class 1A contractor map.",
                 },
             },
         },

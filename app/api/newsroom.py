@@ -12,6 +12,7 @@ from app.models.article import Article
 from app.models.video import Video
 from app.models.video_dubbed_version import VideoDubbedVersion
 from app.services.ingestion_service import IngestionService
+from app.services.translation_service import AI_DISCLOSURE_STATEMENT
 from app.services.video_pipeline_service import VideoPipelineService
 from app.utils.database import get_db
 
@@ -22,6 +23,12 @@ class EditorApprovalPayload(BaseModel):
     edited_transcript_text: str
     edited_transcript_json: Optional[Dict[str, Any]] = None
     editor_name: str = "Kaleva Duty Editor"
+
+
+class EditorRejectionPayload(BaseModel):
+    editor_notes: str
+    editor_name: str = "Kaleva Duty Editor"
+    return_to_draft: bool = True
 
 
 @router.post("/ingest-kaleva")
@@ -38,12 +45,18 @@ def ingest_kaleva_rss(limit: int = 5, db: Session = Depends(get_db)):
 
 
 @router.get("/review-queue")
-def get_review_queue(db: Session = Depends(get_db)):
+def get_review_queue(
+    include_rejected: bool = False, db: Session = Depends(get_db)
+):
     """Return all drafts awaiting human review or flagged by the community."""
     order_col = getattr(VideoDubbedVersion, "updated_at", VideoDubbedVersion.id)
+    statuses = ["pending_review", "flagged_for_review"]
+    if include_rejected:
+        statuses.extend(["rejected", "draft"])
+
     pending = (
         db.query(VideoDubbedVersion)
-        .filter(VideoDubbedVersion.status.in_(["pending_review", "flagged_for_review"]))
+        .filter(VideoDubbedVersion.status.in_(statuses))
         .order_by(order_col.desc())
         .all()
     )
@@ -57,6 +70,13 @@ def get_review_queue(db: Session = Depends(get_db)):
             else None
         )
         t_json = dub.transcript_json if isinstance(dub.transcript_json, dict) else {}
+
+        # Skip items marked irrelevant to expats by the relevance filter unless explicitly flagged
+        if (
+            t_json.get("is_relevant_to_expats") is False
+            and dub.status == "pending_review"
+        ):
+            continue
 
         results.append(
             {
@@ -75,9 +95,18 @@ def get_review_queue(db: Session = Depends(get_db)):
                 ),
                 "headline_en": t_json.get("headline_en"),
                 "relevance_tag": t_json.get("relevance_tag"),
+                "kaleva_user_need": t_json.get("kaleva_user_need", "Understanding"),
+                "high_stakes_warning": t_json.get("high_stakes_warning", False),
+                "journalist_verification_note": t_json.get(
+                    "journalist_verification_note"
+                ),
+                "ai_disclosure": t_json.get(
+                    "ai_disclosure", AI_DISCLOSURE_STATEMENT
+                ),
                 "transcript_text": dub.transcript_text,
                 "expat_explainer_box": t_json.get("expat_explainer_box", []),
                 "community_flags": t_json.get("community_flags", []),
+                "editor_notes": t_json.get("editor_notes", []),
                 "transcript_json": dub.transcript_json,
             }
         )
@@ -85,6 +114,7 @@ def get_review_queue(db: Session = Depends(get_db)):
 
 
 @router.post("/review/{dub_id}/approve")
+@router.patch("/review/{dub_id}/approve")
 def approve_draft(
     dub_id: int,
     payload: EditorApprovalPayload,
@@ -102,15 +132,23 @@ def approve_draft(
 
     dub.transcript_text = payload.edited_transcript_text
     if payload.edited_transcript_json is not None:
-        dub.transcript_json = dict(payload.edited_transcript_json)
-        flag_modified(dub, "transcript_json")
+        updated_json = dict(payload.edited_transcript_json)
     elif isinstance(dub.transcript_json, dict):
         updated_json = dict(dub.transcript_json)
         updated_json["spoken_narration_segments"] = [
             {"start": 0.0, "end": 15.0, "text": payload.edited_transcript_text}
         ]
-        dub.transcript_json = updated_json
-        flag_modified(dub, "transcript_json")
+    else:
+        updated_json = {
+            "spoken_narration_segments": [
+                {"start": 0.0, "end": 15.0, "text": payload.edited_transcript_text}
+            ]
+        }
+
+    updated_json["approved_by"] = payload.editor_name
+    updated_json.setdefault("ai_disclosure", AI_DISCLOSURE_STATEMENT)
+    dub.transcript_json = updated_json
+    flag_modified(dub, "transcript_json")
 
     dub.status = "processing_media"
     db.commit()
@@ -123,4 +161,46 @@ def approve_draft(
         "status": "approved_and_rendering",
         "dub_id": dub.id,
         "approved_by": payload.editor_name,
+        "ai_disclosure": updated_json["ai_disclosure"],
+    }
+
+
+@router.post("/review/{dub_id}/reject")
+@router.patch("/review/{dub_id}/reject")
+def reject_draft(
+    dub_id: int,
+    payload: EditorRejectionPayload,
+    db: Session = Depends(get_db),
+):
+    """Reject a draft or return it to draft status with editorial notes under JSN HITL guidelines."""
+    dub = (
+        db.query(VideoDubbedVersion)
+        .filter(VideoDubbedVersion.id == dub_id)
+        .first()
+    )
+    if not dub:
+        raise HTTPException(status_code=404, detail="Draft not found")
+
+    updated_json = (
+        dict(dub.transcript_json) if isinstance(dub.transcript_json, dict) else {}
+    )
+    notes = list(updated_json.get("editor_notes", []))
+    notes.append(
+        {
+            "editor": payload.editor_name,
+            "note": payload.editor_notes,
+        }
+    )
+    updated_json["editor_notes"] = notes
+    dub.transcript_json = updated_json
+    flag_modified(dub, "transcript_json")
+
+    dub.status = "draft" if payload.return_to_draft else "rejected"
+    db.commit()
+
+    return {
+        "status": dub.status,
+        "dub_id": dub.id,
+        "rejected_by": payload.editor_name,
+        "editor_notes": notes,
     }

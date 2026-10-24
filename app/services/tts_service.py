@@ -4,7 +4,7 @@ import asyncio
 import logging
 import os
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Set, Union
+from typing import Any, Callable, Dict, List, Optional, Set, Union
 
 # Automatically accept Coqui non-commercial license without interactive stdin prompts
 os.environ["COQUI_TOS_AGREED"] = "1"
@@ -351,6 +351,7 @@ class TTSService:
         output_dir: Union[str, Path],
         voice: Optional[str] = None,
         gender: str = "male",
+        on_progress: Optional[Callable[[int, int], None]] = None,
     ) -> List[Dict[str, Any]]:
         """Asynchronously synthesize multiple speech segments concurrently using Edge-TTS."""
         import edge_tts
@@ -359,13 +360,23 @@ class TTSService:
         out_path.mkdir(parents=True, exist_ok=True)
         selected_voice = voice or self.get_voice_for_language(target_language, gender=gender)
 
+        completed_count = 0
+        total_segments = len(segments)
+
         async def _synth_one(idx: int, seg: Dict[str, Any]):
+            nonlocal completed_count
             text = seg.get("text", "").strip()
             if not text:
                 return None
             clip_file = out_path / f"clip_{idx}.mp3"
             communicate = edge_tts.Communicate(text, selected_voice)
             await communicate.save(str(clip_file))
+            completed_count += 1
+            if on_progress:
+                try:
+                    on_progress(completed_count, total_segments)
+                except Exception as cb_err:
+                    logger.debug(f"Progress callback error: {cb_err}")
             return {
                 "path": str(clip_file),
                 "start": float(seg.get("start", 0.0)),
@@ -392,6 +403,7 @@ class TTSService:
         voice: Optional[str] = None,
         engine: str = "xtts",
         gender: Optional[str] = None,
+        on_progress: Optional[Callable[[int, int], None]] = None,
     ) -> List[Dict[str, Any]]:
         """Synthesize a sequence of time-coded segments into individual audio clip files.
 
@@ -403,6 +415,7 @@ class TTSService:
             voice: Voice override for Edge-TTS.
             engine: 'xtts' or 'edge'.
             gender: Speaker gender ('female' or 'male').
+            on_progress: Optional progress callback taking (completed_segments, total_segments).
 
         Returns:
             List[Dict[str, Any]]: List of clips with 'path', 'start', 'end', and 'text'.
@@ -427,6 +440,8 @@ class TTSService:
             and Path(speaker_wav_path).exists()
         )
 
+        total_segments = len(segments)
+
         if use_xtts:
             clips = []
             try:
@@ -435,6 +450,11 @@ class TTSService:
                     text = seg.get("text", "").strip()
                     if not text:
                         continue
+                    if on_progress:
+                        try:
+                            on_progress(idx, total_segments)
+                        except Exception:
+                            pass
                     clip_file = out_path / f"clip_{idx}.wav"
                     model.tts_to_file(
                         text=text,
@@ -442,6 +462,11 @@ class TTSService:
                         language=normalized_lang,
                         file_path=str(clip_file),
                     )
+                    if on_progress:
+                        try:
+                            on_progress(idx + 1, total_segments)
+                        except Exception:
+                            pass
                     clips.append(
                         {
                             "path": str(clip_file),
@@ -469,14 +494,14 @@ class TTSService:
                 future = pool.submit(
                     asyncio.run,
                     self._synthesize_edge_segments_async(
-                        segments, target_language, out_path, voice=voice, gender=resolved_gender
+                        segments, target_language, out_path, voice=voice, gender=resolved_gender, on_progress=on_progress
                     ),
                 )
                 return future.result()
         else:
             return asyncio.run(
                 self._synthesize_edge_segments_async(
-                    segments, target_language, out_path, voice=voice, gender=resolved_gender
+                    segments, target_language, out_path, voice=voice, gender=resolved_gender, on_progress=on_progress
                 )
             )
 
