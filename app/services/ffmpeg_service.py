@@ -339,23 +339,21 @@ class FFmpegService:
         out_file = Path(output_path).resolve()
         out_file.parent.mkdir(parents=True, exist_ok=True)
 
-        total_samples = max(1, int(round(total_duration * sample_rate)))
+        total_samples = max(1, int(round(float(total_duration or 0.0) * sample_rate)))
         master = np.zeros(total_samples, dtype=np.float32)
+        current_end_idx = 0
+        min_gap_samples = int(0.05 * sample_rate)  # 50ms natural pause if clips collide
 
-        for clip in clips:
+        # Sort clips chronologically by scheduled start time
+        sorted_clips = sorted(clips, key=lambda c: float(c.get("start", 0.0)))
+
+        for clip in sorted_clips:
             clip_path = clip.get("path")
             if not clip_path or not Path(clip_path).exists():
                 continue
 
             start_sec = max(0.0, float(clip.get("start", 0.0)))
-            end_sec = float(clip.get("end", start_sec))
-            slot_dur = max(0.1, end_sec - start_sec)
-
-            clip_dur = self.get_media_duration(clip_path)
             actual_path = clip_path
-            tempo = self.compute_tempo(clip_dur, slot_dur, max_speedup=max_speedup)
-            if tempo > 1.02:
-                actual_path = self.adjust_clip_tempo(clip_path, tempo)
 
             data, sr = sf.read(actual_path, dtype="float32")
             if data.ndim > 1:
@@ -369,16 +367,26 @@ class FFmpegService:
                 t_resampled = F.resample(t_data, sr, sample_rate)
                 data = t_resampled.squeeze(0).numpy()
 
-            start_idx = int(round(start_sec * sample_rate))
+            target_start_idx = int(round(start_sec * sample_rate))
+            # Prevent overlapping speech: if previous clip is still speaking, push start position
+            if target_start_idx < current_end_idx:
+                start_idx = current_end_idx + min_gap_samples
+            else:
+                start_idx = target_start_idx
+
             end_idx = start_idx + len(data)
 
-            if start_idx >= total_samples:
-                continue
+            # Dynamically extend master buffer if needed
+            if end_idx > len(master):
+                needed = end_idx - len(master)
+                master = np.pad(master, (0, needed), mode="constant")
 
-            if end_idx > total_samples:
-                master[start_idx:] += data[: total_samples - start_idx]
-            else:
-                master[start_idx:end_idx] += data
+            master[start_idx:end_idx] = data
+            current_end_idx = end_idx
+
+        # Ensure master buffer reaches at least total_samples
+        if len(master) < total_samples:
+            master = np.pad(master, (0, total_samples - len(master)), mode="constant")
 
         peak = float(np.max(np.abs(master)))
         if peak > 1.0:

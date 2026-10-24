@@ -202,14 +202,28 @@ class VideoPipelineService:
                 dubbed_version=DubbedVersionResponse.model_validate(dubbed_version),
             )
 
-        dubbed_audio_ext = "wav" if tts_engine.lower() == "xtts" else "mp3"
         dubbed_audio_dest = (
             ffmpeg_service.dubbed_audio_dir
-            / f"{video.id}_{target_language}_{resolved_video.stem}.{dubbed_audio_ext}"
+            / f"{video.id}_{target_language}_{resolved_video.stem}.wav"
         )
 
+        audio_dur_mismatch = False
+        if (
+            dubbed_version.dubbed_audio_path
+            and Path(dubbed_version.dubbed_audio_path).exists()
+            and (video.duration or 0.0) > 2.0
+        ):
+            current_audio_dur = ffmpeg_service.get_media_duration(dubbed_version.dubbed_audio_path)
+            if abs(current_audio_dur - video.duration) > 1.0:
+                logger.info(
+                    f"Dubbed audio duration ({current_audio_dur:.2f}s) mismatch with video ({video.duration:.2f}s). Re-synthesizing..."
+                )
+                audio_dur_mismatch = True
+
         need_tts = (
-            not dubbed_version.dubbed_audio_path
+            need_translate
+            or audio_dur_mismatch
+            or not dubbed_version.dubbed_audio_path
             or not Path(dubbed_version.dubbed_audio_path).exists()
             or str(dubbed_audio_dest) != str(Path(dubbed_version.dubbed_audio_path).resolve())
             or (tts_engine.lower() == "xtts" and "_edge" in str(dubbed_version.dubbed_audio_path))
@@ -247,45 +261,39 @@ class VideoPipelineService:
                     f"Estimated speaker gender for video ID {video.id}: '{detected_gender}'"
                 )
 
-            # Segment-level timeline assembly
-            segments = dubbed_version.transcript_json or []
-            if segments and isinstance(segments, list):
-                clips_dir = (
-                    ffmpeg_service.dubbed_audio_dir / f"clips_{video.id}_{target_language}"
-                )
-                clips_dir.mkdir(parents=True, exist_ok=True)
-                clips = []
-                for idx, seg in enumerate(segments):
-                    seg_text = seg.get("text", "").strip() if isinstance(seg, dict) else ""
-                    if not seg_text:
-                        continue
-                    clip_ext = "wav" if tts_engine.lower() == "xtts" else "mp3"
-                    clip_path = clips_dir / f"seg_{idx:03d}_{tts_engine}.{clip_ext}"
-                    tts_service.synthesize_speech(
-                        text=seg_text,
-                        target_language=target_language,
-                        speaker_wav_path=speaker_sample_path,
-                        output_path=str(clip_path),
-                        voice=voice,
-                        engine=tts_engine,
-                        gender=detected_gender,
-                    )
-                    clips.append(
-                        {
-                            "path": str(clip_path),
-                            "start": float(seg.get("start", 0.0)),
-                            "end": float(seg.get("end", 0.0)),
-                            "text": seg_text,
-                        }
-                    )
+            segments_to_synth = dubbed_version.transcript_json
+            has_segments = (
+                isinstance(segments_to_synth, list)
+                and len(segments_to_synth) > 0
+                and any(s.get("text", "").strip() for s in segments_to_synth if isinstance(s, dict))
+            )
 
-                total_duration = video.duration or ffmpeg_service.get_media_duration(video.file_path)
+            if has_segments:
+                logger.info(
+                    f"Synthesizing {len(segments_to_synth)} segments on timeline for video ID {video.id}..."
+                )
+                clips_dir = ffmpeg_service.dubbed_audio_dir / f"clips_{video.id}_{target_language}"
+                clips = tts_service.synthesize_segments(
+                    segments=segments_to_synth,
+                    target_language=target_language,
+                    output_dir=clips_dir,
+                    speaker_wav_path=speaker_sample_path,
+                    voice=voice,
+                    engine=tts_engine,
+                    gender=detected_gender,
+                )
+                total_media_dur = video.duration or ffmpeg_service.get_media_duration(str(resolved_video))
                 dubbed_audio_path = ffmpeg_service.build_timeline_track(
                     clips=clips,
-                    total_duration=total_duration,
+                    total_duration=total_media_dur,
                     output_path=str(dubbed_audio_dest),
+                    sample_rate=24000,
+                    max_speedup=1.35,
                 )
             else:
+                logger.info(
+                    f"No structured segments found for video ID {video.id}. Synthesizing full text directly..."
+                )
                 dubbed_audio_path = tts_service.synthesize_speech(
                     text=dubbed_version.transcript_text or "",
                     target_language=target_language,

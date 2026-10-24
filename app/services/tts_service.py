@@ -4,7 +4,7 @@ import asyncio
 import logging
 import os
 from pathlib import Path
-from typing import Any, Dict, Optional, Set, Union
+from typing import Any, Dict, List, Optional, Set, Union
 
 # Automatically accept Coqui non-commercial license without interactive stdin prompts
 os.environ["COQUI_TOS_AGREED"] = "1"
@@ -347,6 +347,142 @@ class TTSService:
 
         # Default / Explicit Edge-TTS
         return self._synthesize_edge_sync(clean_text, target_language, output_path, voice, gender=resolved_gender)
+
+    async def _synthesize_edge_segments_async(
+        self,
+        segments: List[Dict[str, Any]],
+        target_language: str,
+        output_dir: Union[str, Path],
+        voice: Optional[str] = None,
+        gender: str = "male",
+    ) -> List[Dict[str, Any]]:
+        """Asynchronously synthesize multiple speech segments concurrently using Edge-TTS."""
+        import edge_tts
+
+        out_path = Path(output_dir).resolve()
+        out_path.mkdir(parents=True, exist_ok=True)
+        selected_voice = voice or self.get_voice_for_language(target_language, gender=gender)
+
+        async def _synth_one(idx: int, seg: Dict[str, Any]):
+            text = seg.get("text", "").strip()
+            if not text:
+                return None
+            clip_file = out_path / f"clip_{idx}.mp3"
+            communicate = edge_tts.Communicate(text, selected_voice)
+            await communicate.save(str(clip_file))
+            return {
+                "path": str(clip_file),
+                "start": float(seg.get("start", 0.0)),
+                "end": float(seg.get("end", 0.0)),
+                "text": text,
+            }
+
+        tasks = [_synth_one(i, s) for i, s in enumerate(segments)]
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+        clips = []
+        for i, res in enumerate(results):
+            if isinstance(res, Exception):
+                logger.error(f"Failed to synthesize segment {i}: {res}")
+            elif res is not None:
+                clips.append(res)
+        return clips
+
+    def synthesize_segments(
+        self,
+        segments: List[Dict[str, Any]],
+        target_language: str,
+        output_dir: Union[str, Path],
+        speaker_wav_path: Optional[str] = None,
+        voice: Optional[str] = None,
+        engine: str = "xtts",
+        gender: Optional[str] = None,
+    ) -> List[Dict[str, Any]]:
+        """Synthesize a sequence of time-coded segments into individual audio clip files.
+
+        Args:
+            segments: List of dicts with {"start": float, "end": float, "text": str}.
+            target_language: Target language code.
+            output_dir: Directory where segment clips will be stored.
+            speaker_wav_path: Reference speaker wav for voice cloning (XTTS).
+            voice: Voice override for Edge-TTS.
+            engine: 'xtts' or 'edge'.
+            gender: Speaker gender ('female' or 'male').
+
+        Returns:
+            List[Dict[str, Any]]: List of clips with 'path', 'start', 'end', and 'text'.
+        """
+        if not segments:
+            return []
+
+        out_path = Path(output_dir).resolve()
+        out_path.mkdir(parents=True, exist_ok=True)
+
+        normalized_lang = self.normalize_language(target_language)
+        resolved_gender = gender
+        if not resolved_gender and speaker_wav_path and Path(speaker_wav_path).exists():
+            resolved_gender = self.estimate_gender(speaker_wav_path)
+        if not resolved_gender:
+            resolved_gender = "male"
+
+        use_xtts = (
+            engine.lower() == "xtts"
+            and normalized_lang in XTTS_SUPPORTED_LANGUAGES
+            and speaker_wav_path
+            and Path(speaker_wav_path).exists()
+        )
+
+        if use_xtts:
+            clips = []
+            try:
+                model = self._get_xtts_model()
+                for idx, seg in enumerate(segments):
+                    text = seg.get("text", "").strip()
+                    if not text:
+                        continue
+                    clip_file = out_path / f"clip_{idx}.wav"
+                    model.tts_to_file(
+                        text=text,
+                        speaker_wav=str(speaker_wav_path),
+                        language=normalized_lang,
+                        file_path=str(clip_file),
+                    )
+                    clips.append(
+                        {
+                            "path": str(clip_file),
+                            "start": float(seg.get("start", 0.0)),
+                            "end": float(seg.get("end", 0.0)),
+                            "text": text,
+                        }
+                    )
+                return clips
+            except Exception as e:
+                logger.warning(
+                    f"XTTS segment synthesis failed ({e}). Falling back to Edge-TTS."
+                )
+
+        # Edge-TTS (either chosen directly or fallback)
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            loop = None
+
+        if loop and loop.is_running():
+            import concurrent.futures
+
+            with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+                future = pool.submit(
+                    asyncio.run,
+                    self._synthesize_edge_segments_async(
+                        segments, target_language, out_path, voice=voice, gender=resolved_gender
+                    ),
+                )
+                return future.result()
+        else:
+            return asyncio.run(
+                self._synthesize_edge_segments_async(
+                    segments, target_language, out_path, voice=voice, gender=resolved_gender
+                )
+            )
 
 
 tts_service = TTSService()
